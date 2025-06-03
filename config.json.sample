@@ -1,0 +1,13 @@
+{
+  "username": "YourUsername"
+  "password": "YourPassword",
+  "intervalSeconds": 300,
+  "messages": [
+    "...",
+    ".",
+    ",",
+    ".."
+  ],
+  "baseUrl": "https://www.skyskraber.dk",
+  "webSocketUrl": "wss://www.skyskraber.dk/ws"
+}
