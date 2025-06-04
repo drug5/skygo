@@ -45,6 +45,11 @@ type TUI struct {
 	onlineHours  int
 	onlineMinutes int
 	onlineTimeMutex sync.RWMutex
+	// File logging
+	chatLogFile *os.File
+	rawLogFile  *os.File
+	fileMutex   sync.Mutex
+	currentDate string
 }
 
 // ChatBot represents the chat bot instance
@@ -69,6 +74,28 @@ type ChatBot struct {
 	connMutex       sync.RWMutex
 	reconnectCount  int
 	lastReconnect   time.Time
+	// Autopick functionality
+	autopickEnabled bool
+	autopickMutex   sync.RWMutex
+	userPositions   map[string]Position // Track user positions by username
+	droppedItems    map[int]DroppedItem // Track dropped items by ID
+	ownPosition     Position           // Track our own position
+	positionMutex   sync.RWMutex
+}
+
+// Position represents x,y coordinates
+type Position struct {
+	X int `json:"x"`
+	Y int `json:"y"`
+}
+
+// DroppedItem represents an item that was dropped and needs to be picked up
+type DroppedItem struct {
+	ID       int      `json:"id"`
+	Name     string   `json:"name"`
+	Position Position `json:"position"`
+	DroppedBy string  `json:"droppedBy"`
+	DroppedAt time.Time `json:"droppedAt"`
 }
 
 // NewTUI creates a new terminal user interface
@@ -76,6 +103,14 @@ func NewTUI() *TUI {
 	tui := &TUI{
 		app:   tview.NewApplication(),
 		users: make(map[string]bool),
+	}
+
+	// Setup logging first
+	if err := tui.setupLogging(); err != nil {
+		fmt.Printf("❌ Failed to setup logging: %v\n", err)
+		// Continue anyway, just without file logging
+	} else {
+		fmt.Println("📁 Logging initialized - saving to logs/ directory")
 	}
 
 	// Create the main components
@@ -140,6 +175,10 @@ func NewTUI() *TUI {
 
 // AddChatMessage adds a formatted chat message to the chat pane
 func (tui *TUI) AddChatMessage(timestamp, username, message string) {
+	// Write to log file first
+	tui.writeToChatLog(timestamp, username, message)
+
+	// Then update the UI
 	tui.app.QueueUpdateDraw(func() {
 		tui.chatMutex.Lock()
 		defer tui.chatMutex.Unlock()
@@ -163,6 +202,10 @@ func (tui *TUI) AddChatMessage(timestamp, username, message string) {
 
 // AddLogMessage adds a log message to the log pane
 func (tui *TUI) AddLogMessage(message string) {
+	// Write to log file first
+	tui.writeToRawLog(message)
+
+	// Then update the UI
 	tui.app.QueueUpdateDraw(func() {
 		tui.logMutex.Lock()
 		defer tui.logMutex.Unlock()
@@ -216,6 +259,163 @@ func (tui *TUI) RemoveUser(username string) {
 	tui.UpdateUsers(users)
 }
 
+// setupLogging creates the logs directory and initializes log files
+func (tui *TUI) setupLogging() error {
+	// Create logs directory if it doesn't exist
+	if err := os.MkdirAll("logs", 0755); err != nil {
+		return fmt.Errorf("failed to create logs directory: %v", err)
+	}
+
+	// Set current date and open initial log files
+	tui.currentDate = time.Now().Format("2006-01-02")
+	return tui.openLogFiles()
+}
+
+// openLogFiles opens or creates the daily log files
+func (tui *TUI) openLogFiles() error {
+	tui.fileMutex.Lock()
+	defer tui.fileMutex.Unlock()
+
+	// Close existing files if open
+	if tui.chatLogFile != nil {
+		tui.chatLogFile.Close()
+	}
+	if tui.rawLogFile != nil {
+		tui.rawLogFile.Close()
+	}
+
+	// Open chat log file
+	chatLogPath := fmt.Sprintf("logs/%s_chat_log.txt", tui.currentDate)
+	chatFile, err := os.OpenFile(chatLogPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open chat log file: %v", err)
+	}
+	tui.chatLogFile = chatFile
+
+	// Open raw log file
+	rawLogPath := fmt.Sprintf("logs/%s_raw_log.txt", tui.currentDate)
+	rawFile, err := os.OpenFile(rawLogPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		chatFile.Close() // Close chat file if raw file fails
+		return fmt.Errorf("failed to open raw log file: %v", err)
+	}
+	tui.rawLogFile = rawFile
+
+	// Write session start markers
+	timestamp := time.Now().Format("2006-01-02 15:04:05")
+	sessionStart := fmt.Sprintf("\n=== SESSION START: %s ===\n", timestamp)
+	
+	if _, err := tui.chatLogFile.WriteString(sessionStart); err == nil {
+		tui.chatLogFile.Sync()
+	}
+	if _, err := tui.rawLogFile.WriteString(sessionStart); err == nil {
+		tui.rawLogFile.Sync()
+	}
+
+	return nil
+}
+
+// checkDateRotation checks if we need to rotate to new log files for a new day
+func (tui *TUI) checkDateRotation() {
+	currentDate := time.Now().Format("2006-01-02")
+	if currentDate != tui.currentDate {
+		// Write session end to old files
+		timestamp := time.Now().Format("2006-01-02 15:04:05")
+		sessionEnd := fmt.Sprintf("=== SESSION END: %s ===\n", timestamp)
+		
+		tui.fileMutex.Lock()
+		if tui.chatLogFile != nil {
+			tui.chatLogFile.WriteString(sessionEnd)
+			tui.chatLogFile.Sync()
+		}
+		if tui.rawLogFile != nil {
+			tui.rawLogFile.WriteString(sessionEnd)
+			tui.rawLogFile.Sync()
+		}
+		tui.fileMutex.Unlock()
+
+		// Update date and open new files
+		tui.currentDate = currentDate
+		if err := tui.openLogFiles(); err != nil {
+			// If we can't open new files, add error to current log display
+			tui.AddLogMessage(fmt.Sprintf("❌ Failed to rotate log files: %v", err))
+		} else {
+			tui.AddLogMessage("📁 Rotated to new daily log files")
+		}
+	}
+}
+
+// writeToChatLog writes a formatted message to the chat log file
+func (tui *TUI) writeToChatLog(timestamp, username, message string) {
+	tui.checkDateRotation()
+	
+	tui.fileMutex.Lock()
+	defer tui.fileMutex.Unlock()
+
+	if tui.chatLogFile == nil {
+		return
+	}
+
+	timeStr := timestamp
+	if timeStr == "" {
+		timeStr = time.Now().Format("15:04:05")
+	}
+	fullTimestamp := time.Now().Format("2006-01-02 15:04:05")
+
+	var logEntry string
+	if username != "" {
+		logEntry = fmt.Sprintf("[%s] <%s> %s\n", fullTimestamp, username, message)
+	} else {
+		logEntry = fmt.Sprintf("[%s] *** %s\n", fullTimestamp, message)
+	}
+
+	if _, err := tui.chatLogFile.WriteString(logEntry); err == nil {
+		tui.chatLogFile.Sync() // Force write to disk
+	}
+}
+
+// writeToRawLog writes a system log message to the raw log file
+func (tui *TUI) writeToRawLog(message string) {
+	tui.checkDateRotation()
+	
+	tui.fileMutex.Lock()
+	defer tui.fileMutex.Unlock()
+
+	if tui.rawLogFile == nil {
+		return
+	}
+
+	timestamp := time.Now().Format("2006-01-02 15:04:05.000")
+	logEntry := fmt.Sprintf("[%s] %s\n", timestamp, message)
+
+	if _, err := tui.rawLogFile.WriteString(logEntry); err == nil {
+		tui.rawLogFile.Sync() // Force write to disk
+	}
+}
+
+// closeLogFiles safely closes all log files
+func (tui *TUI) closeLogFiles() {
+	tui.fileMutex.Lock()
+	defer tui.fileMutex.Unlock()
+
+	timestamp := time.Now().Format("2006-01-02 15:04:05")
+	sessionEnd := fmt.Sprintf("=== SESSION END: %s ===\n\n", timestamp)
+
+	if tui.chatLogFile != nil {
+		tui.chatLogFile.WriteString(sessionEnd)
+		tui.chatLogFile.Sync()
+		tui.chatLogFile.Close()
+		tui.chatLogFile = nil
+	}
+
+	if tui.rawLogFile != nil {
+		tui.rawLogFile.WriteString(sessionEnd)
+		tui.rawLogFile.Sync()
+		tui.rawLogFile.Close()
+		tui.rawLogFile = nil
+	}
+}
+
 // SetRoom updates the current room and clears users
 func (tui *TUI) SetRoom(roomID, roomName string) {
 	tui.userMutex.Lock()
@@ -254,7 +454,7 @@ func (tui *TUI) GetOnlineTime() (int, int) {
 }
 
 // UpdateStatusBar updates the comprehensive status bar with all information
-func (tui *TUI) UpdateStatusBar(username string, connected bool, roomName, roomID string) {
+func (tui *TUI) UpdateStatusBar(username string, connected bool, roomName, roomID, autopickStatus string) {
 	tui.app.QueueUpdateDraw(func() {
 		currentTime := time.Now().Format("15:04:05")
 		
@@ -275,8 +475,8 @@ func (tui *TUI) UpdateStatusBar(username string, connected bool, roomName, roomI
 			roomInfo = fmt.Sprintf("Room: %s", roomID)
 		}
 		
-		statusText := fmt.Sprintf("[yellow]%s[white] | [green]%s[white] | [cyan]%s[white] | [blue]%s[white]", 
-			currentTime, connStatus, onlineTime, roomInfo)
+		statusText := fmt.Sprintf("[yellow]%s[white] | [green]%s[white] | [cyan]%s[white] | [blue]%s[white] | [magenta]Autopick: %s[white]", 
+			currentTime, connStatus, onlineTime, roomInfo, autopickStatus)
 		
 		tui.statusBar.Clear()
 		fmt.Fprint(tui.statusBar, statusText)
@@ -290,6 +490,7 @@ func (tui *TUI) Run() error {
 
 // Stop stops the TUI application
 func (tui *TUI) Stop() {
+	tui.closeLogFiles()
 	tui.app.Stop()
 }
 
@@ -356,6 +557,11 @@ func NewChatBot(config *Config, tui *TUI) *ChatBot {
 		tui:             tui,
 		isConnected:     false,
 		reconnectCount:  0,
+		// Initialize autopick
+		autopickEnabled: false,
+		userPositions:   make(map[string]Position),
+		droppedItems:    make(map[int]DroppedItem),
+		ownPosition:     Position{X: 0, Y: 0},
 	}
 }
 
@@ -385,9 +591,275 @@ func (bot *ChatBot) setConnectionStatus(connected bool) {
 	}
 }
 
+// isAutopickEnabled safely checks if autopick is enabled
+func (bot *ChatBot) isAutopickEnabled() bool {
+	bot.autopickMutex.RLock()
+	defer bot.autopickMutex.RUnlock()
+	return bot.autopickEnabled
+}
+
+// setAutopickEnabled safely sets autopick status
+func (bot *ChatBot) setAutopickEnabled(enabled bool) {
+	bot.autopickMutex.Lock()
+	bot.autopickEnabled = enabled
+	bot.autopickMutex.Unlock()
+	
+	status := "DISABLED"
+	if enabled {
+		status = "ENABLED"
+	}
+	bot.log("🤖 Autopick %s", status)
+	bot.updateFullStatus()
+}
+
+// updateUserPosition updates a user's position
+func (bot *ChatBot) updateUserPosition(username string, x, y int) {
+	bot.positionMutex.Lock()
+	defer bot.positionMutex.Unlock()
+	
+	if username == bot.username {
+		bot.ownPosition = Position{X: x, Y: y}
+		bot.log("📍 Own position updated: (%d, %d)", x, y)
+	} else {
+		// Check if this user has any items they dropped and moved away from
+		if bot.isAutopickEnabled() {
+			oldPos, hadPosition := bot.userPositions[username]
+			bot.userPositions[username] = Position{X: x, Y: y}
+			
+			// If user moved and had a previous position, check for item opportunities immediately
+			if hadPosition && (oldPos.X != x || oldPos.Y != y) {
+				go bot.checkItemOpportunities(username, oldPos)
+			}
+		} else {
+			bot.userPositions[username] = Position{X: x, Y: y}
+		}
+	}
+}
+
+// checkItemOpportunities immediately checks if user movement creates pickup opportunities
+func (bot *ChatBot) checkItemOpportunities(username string, oldPos Position) {
+	// Check all tracked items to see if this user moved away from any
+	bot.positionMutex.RLock()
+	var itemsToCheck []DroppedItem
+	for _, item := range bot.droppedItems {
+		if item.DroppedBy == username && item.Position.X == oldPos.X && item.Position.Y == oldPos.Y {
+			itemsToCheck = append(itemsToCheck, item)
+		}
+	}
+	bot.positionMutex.RUnlock()
+	
+	// Immediately attempt to pick up items the user moved away from
+	for _, item := range itemsToCheck {
+		bot.log("⚡ User %s moved away from %s, immediate pickup attempt", username, item.Name)
+		
+		// Move to the item position immediately
+		if err := bot.moveToPosition(item.Position.X, item.Position.Y); err != nil {
+			bot.log("❌ Failed to move to item position: %v", err)
+			continue
+		}
+		
+		// Very short wait for movement command to be processed
+		time.Sleep(150 * time.Millisecond)
+		
+		// Pick up the item immediately
+		if err := bot.pickupItem(item.ID); err != nil {
+			bot.log("❌ Failed to pick up item: %v", err)
+			continue
+		}
+		
+		// Remove from our tracked items
+		bot.positionMutex.Lock()
+		delete(bot.droppedItems, item.ID)
+		bot.positionMutex.Unlock()
+		
+		bot.log("✅ Successfully picked up %s (ID:%d)", item.Name, item.ID)
+		bot.tui.AddChatMessage("", "", fmt.Sprintf("🤖 Autopicked: %s", item.Name))
+		
+		// Only pick up one item at a time to avoid conflicts
+		break
+	}
+}
+
+// handleItemDropped processes when an item is dropped by a user
+func (bot *ChatBot) handleItemDropped(itemID int, itemName string, x, y int, droppedByUsername string) {
+	if !bot.isAutopickEnabled() {
+		return
+	}
+
+	bot.positionMutex.Lock()
+	defer bot.positionMutex.Unlock()
+
+	// Store the dropped item
+	droppedItem := DroppedItem{
+		ID:       itemID,
+		Name:     itemName,
+		Position: Position{X: x, Y: y},
+		DroppedBy: droppedByUsername,
+		DroppedAt: time.Now(),
+	}
+	
+	bot.droppedItems[itemID] = droppedItem
+	bot.log("📦 Item dropped: %s (ID:%d) at (%d,%d) by %s", itemName, itemID, x, y, droppedByUsername)
+	
+	// Start monitoring this item for pickup opportunity with fast reaction
+	go bot.monitorDroppedItemFast(droppedItem)
+}
+
+// monitorDroppedItemFast watches a dropped item with minimal delays for fast pickup
+func (bot *ChatBot) monitorDroppedItemFast(item DroppedItem) {
+	// Very short initial wait to allow for position updates to propagate
+	time.Sleep(100 * time.Millisecond)
+	
+	maxWaitTime := 5 * time.Second // Maximum time to wait before giving up
+	startTime := time.Now()
+	checkInterval := 50 * time.Millisecond // Check every 50ms for very fast reaction
+	
+	for time.Since(startTime) < maxWaitTime {
+		// Check if item still exists (hasn't been picked up by someone else)
+		bot.positionMutex.RLock()
+		_, exists := bot.droppedItems[item.ID]
+		bot.positionMutex.RUnlock()
+		
+		if !exists {
+			bot.log("📦 Item %s (ID:%d) no longer available", item.Name, item.ID)
+			return
+		}
+
+		// Check if the dropper is still at the item position
+		bot.positionMutex.RLock()
+		dropperPos, dropperExists := bot.userPositions[item.DroppedBy]
+		bot.positionMutex.RUnlock()
+		
+		// If dropper moved away or is no longer visible, immediately attempt pickup
+		if !dropperExists || (dropperPos.X != item.Position.X || dropperPos.Y != item.Position.Y) {
+			bot.log("🏃 User %s moved away from %s, attempting immediate pickup", item.DroppedBy, item.Name)
+			
+			// Move to the item position immediately
+			if err := bot.moveToPosition(item.Position.X, item.Position.Y); err != nil {
+				bot.log("❌ Failed to move to item position: %v", err)
+				return
+			}
+			
+			// Very short wait for movement command to be processed by server
+			time.Sleep(200 * time.Millisecond)
+			
+			// Pick up the item immediately
+			if err := bot.pickupItem(item.ID); err != nil {
+				bot.log("❌ Failed to pick up item: %v", err)
+				return
+			}
+			
+			// Remove from our tracked items
+			bot.positionMutex.Lock()
+			delete(bot.droppedItems, item.ID)
+			bot.positionMutex.Unlock()
+			
+			bot.log("✅ Successfully picked up %s (ID:%d)", item.Name, item.ID)
+			bot.tui.AddChatMessage("", "", fmt.Sprintf("🤖 Autopicked: %s", item.Name))
+			return
+		}
+		
+		// User still at item position, wait a bit and check again
+		time.Sleep(checkInterval)
+	}
+	
+	// Timeout reached, stop monitoring this item
+	bot.log("⏱️ Timeout waiting for user %s to move away from %s", item.DroppedBy, item.Name)
+}
+
+// handleItemPickedUp processes when an item is picked up (removes from tracking)
+func (bot *ChatBot) handleItemPickedUp(itemID int) {
+	bot.positionMutex.Lock()
+	defer bot.positionMutex.Unlock()
+	
+	if item, exists := bot.droppedItems[itemID]; exists {
+		delete(bot.droppedItems, itemID)
+		bot.log("📦 Item %s (ID:%d) was picked up by someone", item.Name, itemID)
+	}
+}
+
+// moveToPosition sends a move command to the specified coordinates
+func (bot *ChatBot) moveToPosition(x, y int) error {
+	if !bot.isConnectionHealthy() {
+		return fmt.Errorf("WebSocket connection not healthy")
+	}
+
+	bot.wsMutex.Lock()
+	defer bot.wsMutex.Unlock()
+
+	if bot.wsConn == nil {
+		return fmt.Errorf("WebSocket connection not established")
+	}
+
+	movePayload := map[string]interface{}{
+		"type": "move",
+		"data": map[string]interface{}{
+			"x": x,
+			"y": y,
+		},
+	}
+
+	msgBytes, err := json.Marshal(movePayload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal move command: %v", err)
+	}
+
+	bot.log("🚶 Moving to position (%d, %d)", x, y)
+	bot.wsConn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	err = bot.wsConn.WriteMessage(websocket.TextMessage, msgBytes)
+	if err != nil {
+		bot.setConnectionStatus(false)
+		return fmt.Errorf("failed to send move command: %v", err)
+	}
+
+	// Update our own position
+	bot.updateUserPosition(bot.username, x, y)
+	return nil
+}
+
+// pickupItem sends a pickup command for the specified item ID
+func (bot *ChatBot) pickupItem(itemID int) error {
+	if !bot.isConnectionHealthy() {
+		return fmt.Errorf("WebSocket connection not healthy")
+	}
+
+	bot.wsMutex.Lock()
+	defer bot.wsMutex.Unlock()
+
+	if bot.wsConn == nil {
+		return fmt.Errorf("WebSocket connection not established")
+	}
+
+	pickupPayload := map[string]interface{}{
+		"type": "pick up",
+		"data": map[string]interface{}{
+			"item": itemID,
+		},
+	}
+
+	msgBytes, err := json.Marshal(pickupPayload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal pickup command: %v", err)
+	}
+
+	bot.log("📦 Picking up item ID: %d", itemID)
+	bot.wsConn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	err = bot.wsConn.WriteMessage(websocket.TextMessage, msgBytes)
+	if err != nil {
+		bot.setConnectionStatus(false)
+		return fmt.Errorf("failed to send pickup command: %v", err)
+	}
+
+	return nil
+}
+
 // updateFullStatus updates the complete status bar
 func (bot *ChatBot) updateFullStatus() {
-	bot.tui.UpdateStatusBar(bot.username, bot.isConnected, bot.currentRoomName, bot.currentRoom)
+	autopickStatus := "OFF"
+	if bot.isAutopickEnabled() {
+		autopickStatus = "ON"
+	}
+	bot.tui.UpdateStatusBar(bot.username, bot.isConnected, bot.currentRoomName, bot.currentRoom, autopickStatus)
 }
 
 // isConnectionHealthy checks if connection is healthy
@@ -424,7 +896,11 @@ func (bot *ChatBot) fullReconnect() error {
 	delay := bot.calculateReconnectDelay()
 	
 	bot.log("🔄 Attempting full reconnection #%d (delay: %v)...", bot.reconnectCount, delay)
-	bot.tui.UpdateStatusBar(bot.username, false, bot.currentRoomName, fmt.Sprintf("Reconnecting... (attempt %d)", bot.reconnectCount))
+	autopickStatus := "OFF"
+	if bot.isAutopickEnabled() {
+		autopickStatus = "ON"
+	}
+	bot.tui.UpdateStatusBar(bot.username, false, bot.currentRoomName, fmt.Sprintf("Reconnecting... (attempt %d)", bot.reconnectCount), autopickStatus)
 	
 	// Wait with exponential backoff
 	time.Sleep(delay)
@@ -824,6 +1300,22 @@ func (bot *ChatBot) listenForMessages() {
 							if client, clientOk := update.(map[string]interface{}); clientOk {
 								if username, usernameOk := client["username"].(string); usernameOk {
 									users = append(users, username)
+									
+									// Track initial positions
+									if x, xOk := client["x"].(float64); xOk {
+										if y, yOk := client["y"].(float64); yOk {
+											bot.updateUserPosition(username, int(x), int(y))
+										}
+									}
+									
+									// Track our own position
+									if isPlayer, playerOk := client["isPlayer"].(bool); playerOk && isPlayer {
+										if x, xOk := client["x"].(float64); xOk {
+											if y, yOk := client["y"].(float64); yOk {
+												bot.updateUserPosition(bot.username, int(x), int(y))
+											}
+										}
+									}
 								}
 							}
 						}
@@ -833,14 +1325,33 @@ func (bot *ChatBot) listenForMessages() {
 				}
 			}
 
-			// Handle client updates (user joins)
+			// Handle client updates (user joins and position updates)
 			if clientsData, ok := messageData["clients"].(map[string]interface{}); ok {
 				// Handle user joins (updates)
 				if updates, updatesOk := clientsData["updates"].([]interface{}); updatesOk {
 					for _, update := range updates {
 						if client, clientOk := update.(map[string]interface{}); clientOk {
-							if username, usernameOk := client["username"].(string); usernameOk {
-								// Check if this is a new user join (not initial room data)
+							// Extract user info
+							var username string
+							var userX, userY int
+							
+							if name, nameOk := client["username"].(string); nameOk {
+								username = name
+							}
+							if x, xOk := client["x"].(float64); xOk {
+								userX = int(x)
+							}
+							if y, yOk := client["y"].(float64); yOk {
+								userY = int(y)
+							}
+
+							// Update user position if we have coordinates
+							if username != "" && (userX != 0 || userY != 0) {
+								bot.updateUserPosition(username, userX, userY)
+							}
+
+							// Check for new user join (not initial room data)
+							if username != "" {
 								if _, hasRoom := messageData["room"]; !hasRoom {
 									bot.tui.AddUser(username)
 									bot.log("👤 User joined: %s", username)
@@ -859,6 +1370,41 @@ func (bot *ChatBot) listenForMessages() {
 														// Don't display your own messages again (they're already shown when sent)
 														if username != bot.username {
 															bot.tui.AddChatMessage("", username, message)
+														}
+													}
+												}
+											}
+										}
+									}
+								}
+							}
+
+							// Handle item removal from user (item being dropped)
+							if items, itemsOk := client["items"].(map[string]interface{}); itemsOk {
+								if removes, removesOk := items["removes"].([]interface{}); removesOk {
+									for _, removeItem := range removes {
+										if itemID, itemIDOk := removeItem.(float64); itemIDOk {
+											// Check if there's a corresponding item update (item being dropped)
+											if itemsUpdates, hasItemsUpdates := messageData["items"].(map[string]interface{}); hasItemsUpdates {
+												if updatesArray, updatesOk := itemsUpdates["updates"].([]interface{}); updatesOk {
+													for _, itemUpdate := range updatesArray {
+														if item, itemOk := itemUpdate.(map[string]interface{}); itemOk {
+															if id, idOk := item["id"].(float64); idOk && int(id) == int(itemID) {
+																// This is an item being dropped
+																itemName := "Unknown Item"
+																if name, nameOk := item["name"].(string); nameOk {
+																	itemName = name
+																}
+																itemX, itemY := 0, 0
+																if x, xOk := item["x"].(float64); xOk {
+																	itemX = int(x)
+																}
+																if y, yOk := item["y"].(float64); yOk {
+																	itemY = int(y)
+																}
+																
+																bot.handleItemDropped(int(itemID), itemName, itemX, itemY, username)
+															}
 														}
 													}
 												}
@@ -890,6 +1436,11 @@ func (bot *ChatBot) listenForMessages() {
 														bot.tui.RemoveUser(username)
 														bot.tui.AddChatMessage("", "", message)
 														bot.log("👤 User left/disconnected: %s", username)
+														
+														// Remove from position tracking
+														bot.positionMutex.Lock()
+														delete(bot.userPositions, username)
+														bot.positionMutex.Unlock()
 													}
 												}
 											}
@@ -897,6 +1448,18 @@ func (bot *ChatBot) listenForMessages() {
 									}
 								}
 							}
+						}
+					}
+				}
+			}
+
+			// Handle item pickups (items being removed from the game)
+			if itemsData, ok := messageData["items"].(map[string]interface{}); ok {
+				if removes, removesOk := itemsData["removes"].([]interface{}); removesOk {
+					for _, removeItem := range removes {
+						if itemID, itemIDOk := removeItem.(float64); itemIDOk {
+							// This is an item being picked up by someone
+							bot.handleItemPickedUp(int(itemID))
 						}
 					}
 				}
@@ -1065,10 +1628,16 @@ func (bot *ChatBot) setupInputHandler() {
 						bot.tui.AddChatMessage("", "", "/status - Show bot status")
 						bot.tui.AddChatMessage("", "", "/reconnect - Force reconnection")
 						bot.tui.AddChatMessage("", "", "/clear - Clear chat history")
+						bot.tui.AddChatMessage("", "", "/logs - Show log file information")
+						bot.tui.AddChatMessage("", "", "/autopick - Toggle autopick on/off")
 					case "/status":
 						wsStatus := "Disconnected"
 						if bot.isConnectionHealthy() {
 							wsStatus = "Connected"
+						}
+						autopickStatus := "DISABLED"
+						if bot.isAutopickEnabled() {
+							autopickStatus = "ENABLED"
 						}
 						hours, minutes := bot.tui.GetOnlineTime()
 						bot.tui.AddChatMessage("", "", fmt.Sprintf("Username: %s", bot.username))
@@ -1076,9 +1645,18 @@ func (bot *ChatBot) setupInputHandler() {
 						bot.tui.AddChatMessage("", "", fmt.Sprintf("WebSocket: %s", wsStatus))
 						bot.tui.AddChatMessage("", "", fmt.Sprintf("Online Time: %dh %dm", hours, minutes))
 						bot.tui.AddChatMessage("", "", fmt.Sprintf("Message Interval: %v", bot.messageInterval))
+						bot.tui.AddChatMessage("", "", fmt.Sprintf("Autopick: %s", autopickStatus))
 						bot.tui.AddChatMessage("", "", fmt.Sprintf("Reconnect Count: %d", bot.reconnectCount))
 						if !bot.lastReconnect.IsZero() {
 							bot.tui.AddChatMessage("", "", fmt.Sprintf("Last Reconnect: %s", bot.lastReconnect.Format("15:04:05")))
+						}
+						
+						// Show tracked items if autopick is enabled
+						if bot.isAutopickEnabled() {
+							bot.positionMutex.RLock()
+							itemCount := len(bot.droppedItems)
+							bot.positionMutex.RUnlock()
+							bot.tui.AddChatMessage("", "", fmt.Sprintf("Tracked Items: %d", itemCount))
 						}
 					case "/reconnect":
 						bot.tui.AddChatMessage("", "", "*** Forcing reconnection... ***")
@@ -1093,6 +1671,24 @@ func (bot *ChatBot) setupInputHandler() {
 								bot.tui.AddChatMessage("", "", "*** Reconnection failed ***")
 							}
 						}()
+					case "/autopick":
+						currentStatus := bot.isAutopickEnabled()
+						bot.setAutopickEnabled(!currentStatus)
+						newStatus := "ENABLED"
+						if !bot.isAutopickEnabled() {
+							newStatus = "DISABLED"
+						}
+						bot.tui.AddChatMessage("", "", fmt.Sprintf("🤖 Autopick %s", newStatus))
+					case "/logs":
+						currentDate := time.Now().Format("2006-01-02")
+						chatLogPath := fmt.Sprintf("logs/%s_chat_log.txt", currentDate)
+						rawLogPath := fmt.Sprintf("logs/%s_raw_log.txt", currentDate)
+						
+						bot.tui.AddChatMessage("", "", "📁 Log File Information:")
+						bot.tui.AddChatMessage("", "", fmt.Sprintf("Chat Log: %s", chatLogPath))
+						bot.tui.AddChatMessage("", "", fmt.Sprintf("System Log: %s", rawLogPath))
+						bot.tui.AddChatMessage("", "", "All logs are saved with daily rotation")
+						bot.tui.AddChatMessage("", "", "Format: YYYY-MM-DD_[chat_log|raw_log].txt")
 					case "/clear":
 						bot.tui.app.QueueUpdateDraw(func() {
 							bot.tui.chatView.Clear()
@@ -1158,16 +1754,16 @@ func (bot *ChatBot) startStatusUpdater() {
 // Start initializes and runs the bot
 func (bot *ChatBot) Start() error {
 	bot.log("🚀 Starting Skyskraber chat bot...")
-	bot.tui.UpdateStatusBar(bot.username, false, "", "Starting...")
+	bot.tui.UpdateStatusBar(bot.username, false, "", "Starting...", "OFF")
 
 	bot.log("🔐 Step 1: Authenticating...")
-	bot.tui.UpdateStatusBar(bot.username, false, "", "Authenticating...")
+	bot.tui.UpdateStatusBar(bot.username, false, "", "Authenticating...", "OFF")
 	if err := bot.login(); err != nil {
 		return fmt.Errorf("login failed: %v", err)
 	}
 
 	bot.log("🔌 Step 2: Establishing WebSocket connection...")
-	bot.tui.UpdateStatusBar(bot.username, false, "", "Connecting...")
+	bot.tui.UpdateStatusBar(bot.username, false, "", "Connecting...", "OFF")
 	if err := bot.connectWebSocket(); err != nil {
 		return fmt.Errorf("WebSocket connection failed: %v", err)
 	}
@@ -1197,6 +1793,8 @@ func (bot *ChatBot) Start() error {
 	bot.tui.AddChatMessage("", "", "=== Skyskraber Chat Bot Started ===")
 	bot.tui.AddChatMessage("", "", "Type /help for available commands")
 	bot.tui.AddChatMessage("", "", "Press Ctrl+C or type /quit to exit")
+	bot.tui.AddChatMessage("", "", "📁 Logs are being saved to logs/ directory")
+	bot.tui.AddChatMessage("", "", "🤖 Autopick is DISABLED by default - use /autopick to enable")
 	
 	return nil
 }
@@ -1222,6 +1820,9 @@ func (bot *ChatBot) Stop() {
 		bot.wsConn = nil
 		bot.log("🔌 WebSocket connection closed.")
 	}
+	
+	bot.log("📁 Closing log files...")
+	bot.tui.closeLogFiles()
 	bot.log("✅ Bot stopped.")
 }
 
@@ -1269,7 +1870,8 @@ func main() {
 		sig := <-sigChan
 		botInstance.log("🛑 Received signal: %v. Initiating graceful shutdown...", sig)
 		botInstance.Stop()
-		tui.app.Stop()
+		tui.Stop() // This will close log files
+		fmt.Println("\n👋 Goodbye! Logs saved to logs/ directory.")
 		os.Exit(0)
 	}()
 
