@@ -1,4 +1,4 @@
-module skyskraber-bot
+module skyGO
 
 go 1.21
 
