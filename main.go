@@ -61,6 +61,10 @@ type ChatBot struct {
 	messageTimer    *time.Timer
 	timerMutex      sync.Mutex
 	tui             *TUI
+	isConnected     bool
+	connMutex       sync.RWMutex
+	reconnectCount  int
+	lastReconnect   time.Time
 }
 
 // NewTUI creates a new terminal user interface
@@ -309,7 +313,100 @@ func NewChatBot(config *Config, tui *TUI) *ChatBot {
 		messages:        config.Messages,
 		currentMsgIndex: 0,
 		tui:             tui,
+		isConnected:     false,
+		reconnectCount:  0,
 	}
+}
+
+// setConnectionStatus safely updates connection status
+func (bot *ChatBot) setConnectionStatus(connected bool) {
+	bot.connMutex.Lock()
+	defer bot.connMutex.Unlock()
+	
+	wasConnected := bot.isConnected
+	bot.isConnected = connected
+	
+	if connected && !wasConnected {
+		bot.reconnectCount = 0
+		bot.tui.UpdateStatus(fmt.Sprintf("Connected as %s | Room: %s | Type /help for commands", bot.username, bot.currentRoom))
+		bot.log("🟢 Connection status: CONNECTED")
+	} else if !connected && wasConnected {
+		bot.tui.UpdateStatus(fmt.Sprintf("DISCONNECTED - Attempting reconnect... | %s", bot.username))
+		bot.log("🔴 Connection status: DISCONNECTED")
+	}
+}
+
+// isConnectionHealthy checks if connection is healthy
+func (bot *ChatBot) isConnectionHealthy() bool {
+	bot.connMutex.RLock()
+	defer bot.connMutex.RUnlock()
+	return bot.isConnected && bot.wsConn != nil
+}
+
+// calculateReconnectDelay returns exponential backoff delay
+func (bot *ChatBot) calculateReconnectDelay() time.Duration {
+	baseDelay := 5 * time.Second
+	maxDelay := 5 * time.Minute
+	
+	delay := time.Duration(baseDelay.Nanoseconds() * int64(1<<min(bot.reconnectCount, 6)))
+	if delay > maxDelay {
+		delay = maxDelay
+	}
+	
+	return delay
+}
+
+// min helper function
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// fullReconnect performs complete reconnection including re-authentication
+func (bot *ChatBot) fullReconnect() error {
+	bot.reconnectCount++
+	delay := bot.calculateReconnectDelay()
+	
+	bot.log("🔄 Attempting full reconnection #%d (delay: %v)...", bot.reconnectCount, delay)
+	bot.tui.UpdateStatus(fmt.Sprintf("Reconnecting... (attempt %d, delay %v)", bot.reconnectCount, delay))
+	
+	// Wait with exponential backoff
+	time.Sleep(delay)
+	
+	// Close existing connection if any
+	if bot.wsConn != nil {
+		bot.wsConn.Close()
+		bot.wsConn = nil
+	}
+	
+	bot.setConnectionStatus(false)
+	
+	// Step 1: Re-authenticate if enough time has passed or if we've had many failures
+	timeSinceLastReconnect := time.Since(bot.lastReconnect)
+	if timeSinceLastReconnect > 10*time.Minute || bot.reconnectCount > 3 {
+		bot.log("🔐 Re-authenticating due to extended disconnection...")
+		if err := bot.login(); err != nil {
+			bot.log("❌ Re-authentication failed: %v", err)
+			return fmt.Errorf("re-authentication failed: %v", err)
+		}
+		bot.log("✅ Re-authentication successful")
+	}
+	
+	// Step 2: Establish WebSocket connection
+	bot.log("🔌 Re-establishing WebSocket connection...")
+	if err := bot.connectWebSocket(); err != nil {
+		bot.log("❌ WebSocket reconnection failed: %v", err)
+		return fmt.Errorf("WebSocket reconnection failed: %v", err)
+	}
+	
+	bot.setConnectionStatus(true)
+	bot.lastReconnect = time.Now()
+	bot.log("✅ Full reconnection successful!")
+	bot.tui.AddChatMessage("", "", "*** Reconnected to chat server ***")
+	
+	return nil
 }
 
 // log is a helper function to log to the TUI instead of stdout
@@ -482,6 +579,10 @@ func (bot *ChatBot) connectWebSocket() error {
 
 // sendMessageInternal sends a message over WebSocket and optionally resets the periodic timer
 func (bot *ChatBot) sendMessageInternal(message string, resetTimer bool) error {
+	if !bot.isConnectionHealthy() {
+		return fmt.Errorf("WebSocket connection not healthy")
+	}
+
 	bot.wsMutex.Lock()
 	defer bot.wsMutex.Unlock()
 
@@ -512,6 +613,8 @@ func (bot *ChatBot) sendMessageInternal(message string, resetTimer bool) error {
 	err = bot.wsConn.WriteMessage(websocket.TextMessage, msgBytes)
 	if err != nil {
 		bot.log("❌ Failed to send message: %v", err)
+		// Mark connection as unhealthy on write failure
+		bot.setConnectionStatus(false)
 		return fmt.Errorf("failed to send message: %v", err)
 	}
 
@@ -562,6 +665,10 @@ func (bot *ChatBot) resetMessageTimer() {
 
 // sendAcknowledgment sends a specific acknowledgment message to the server
 func (bot *ChatBot) sendAcknowledgment(messageType string) error {
+	if !bot.isConnectionHealthy() {
+		return fmt.Errorf("WebSocket connection not healthy")
+	}
+
 	bot.wsMutex.Lock()
 	defer bot.wsMutex.Unlock()
 
@@ -595,6 +702,8 @@ func (bot *ChatBot) sendAcknowledgment(messageType string) error {
 	err = bot.wsConn.WriteMessage(websocket.TextMessage, msgBytes)
 	if err != nil {
 		bot.log("❌ Failed to send acknowledgment for '%s': %v", messageType, err)
+		// Mark connection as unhealthy on write failure
+		bot.setConnectionStatus(false)
 		return fmt.Errorf("failed to send acknowledgment for '%s': %v", messageType, err)
 	}
 
@@ -605,31 +714,43 @@ func (bot *ChatBot) sendAcknowledgment(messageType string) error {
 // listenForMessages reads messages from WebSocket and processes them
 func (bot *ChatBot) listenForMessages() {
 	bot.log("👂 Starting message listener...")
+	
 	for {
-		if bot.wsConn == nil {
-			bot.log("⚠️ WebSocket connection is nil in listener, waiting for reconnect...")
-			time.Sleep(2 * time.Second)
+		// Check if we need to reconnect
+		if !bot.isConnectionHealthy() {
+			bot.log("🔄 Connection unhealthy, attempting full reconnection...")
+			
+			if err := bot.fullReconnect(); err != nil {
+				bot.log("❌ Full reconnection failed: %v. Will retry...", err)
+				continue
+			}
+			
+			bot.log("✅ Reconnection successful, resuming message listening...")
 			continue
 		}
 
+		// Set read deadline to detect dead connections
+		bot.wsConn.SetReadDeadline(time.Now().Add(90 * time.Second))
 		_, message, err := bot.wsConn.ReadMessage()
+		
 		if err != nil {
 			bot.log("❌ Error reading message: %v", err)
+			
+			// Mark connection as unhealthy
+			bot.setConnectionStatus(false)
+			
+			// Close the connection
 			if bot.wsConn != nil {
 				bot.wsConn.Close()
+				bot.wsConn = nil
 			}
-			bot.wsConn = nil
-
-			bot.log("🔄 Connection lost, attempting to reconnect WebSocket...")
-			time.Sleep(5 * time.Second)
-			if errConnect := bot.connectWebSocket(); errConnect != nil {
-				bot.log("❌ Reconnection failed: %v. Will retry...", errConnect)
-			} else {
-				bot.log("✅ Reconnected successfully after connection loss!")
-			}
+			
+			bot.log("🔄 Connection lost, will attempt reconnection...")
 			continue
 		}
 
+		// Reset read deadline on successful read
+		bot.wsConn.SetReadDeadline(time.Time{})
 		bot.log("📥 Raw message received: %s", string(message))
 
 		var messageData map[string]interface{}
@@ -643,6 +764,7 @@ func (bot *ChatBot) listenForMessages() {
 							bot.log("🚪 Room changed by server: %s -> %s (%s)", bot.currentRoom, newRoomID, nameVal)
 							bot.currentRoom = newRoomID
 							bot.tui.SetRoom(newRoomID, nameVal)
+							bot.tui.UpdateStatus(fmt.Sprintf("Connected as %s | Room: %s | Type /help for commands", bot.username, newRoomID))
 						}
 					}
 				}
@@ -798,19 +920,21 @@ func (bot *ChatBot) sendPeriodicMessages() {
 
 		<-timerC
 
-		if bot.wsConn != nil && len(bot.messages) > 0 {
+		// Only send if connection is healthy
+		if bot.isConnectionHealthy() && len(bot.messages) > 0 {
 			message := bot.messages[bot.currentMsgIndex]
 			bot.log("⏰ Time to send periodic message [%d/%d]: '%s'", bot.currentMsgIndex+1, len(bot.messages), message)
 			if err := bot.sendMessage(message); err != nil {
 				bot.log("❌ Failed to send periodic message: %v", err)
+				// Don't advance message index on failure
 			} else {
 				bot.log("✅ Periodic message sent successfully: '%s'", message)
 				// Show the message in chat as well
 				bot.tui.AddChatMessage("", bot.username, message)
+				bot.currentMsgIndex = (bot.currentMsgIndex + 1) % len(bot.messages)
 			}
-			bot.currentMsgIndex = (bot.currentMsgIndex + 1) % len(bot.messages)
-		} else if bot.wsConn == nil {
-			bot.log("⚠️ Skipping periodic message - WebSocket not connected.")
+		} else if !bot.isConnectionHealthy() {
+			bot.log("⚠️ Skipping periodic message - connection not healthy")
 		}
 
 		bot.timerMutex.Lock()
@@ -850,16 +974,34 @@ func (bot *ChatBot) setupInputHandler() {
 						bot.tui.AddChatMessage("", "", "/quit, /exit, /q - Exit the bot")
 						bot.tui.AddChatMessage("", "", "/help, /h - Show this help")
 						bot.tui.AddChatMessage("", "", "/status - Show bot status")
+						bot.tui.AddChatMessage("", "", "/reconnect - Force reconnection")
 						bot.tui.AddChatMessage("", "", "/clear - Clear chat history")
 					case "/status":
 						wsStatus := "Disconnected"
-						if bot.wsConn != nil {
+						if bot.isConnectionHealthy() {
 							wsStatus = "Connected"
 						}
 						bot.tui.AddChatMessage("", "", fmt.Sprintf("Username: %s", bot.username))
 						bot.tui.AddChatMessage("", "", fmt.Sprintf("Current Room: %s", bot.currentRoom))
 						bot.tui.AddChatMessage("", "", fmt.Sprintf("WebSocket: %s", wsStatus))
 						bot.tui.AddChatMessage("", "", fmt.Sprintf("Message Interval: %v", bot.messageInterval))
+						bot.tui.AddChatMessage("", "", fmt.Sprintf("Reconnect Count: %d", bot.reconnectCount))
+						if !bot.lastReconnect.IsZero() {
+							bot.tui.AddChatMessage("", "", fmt.Sprintf("Last Reconnect: %s", bot.lastReconnect.Format("15:04:05")))
+						}
+					case "/reconnect":
+						bot.tui.AddChatMessage("", "", "*** Forcing reconnection... ***")
+						go func() {
+							bot.setConnectionStatus(false)
+							if bot.wsConn != nil {
+								bot.wsConn.Close()
+								bot.wsConn = nil
+							}
+							if err := bot.fullReconnect(); err != nil {
+								bot.log("❌ Manual reconnection failed: %v", err)
+								bot.tui.AddChatMessage("", "", "*** Reconnection failed ***")
+							}
+						}()
 					case "/clear":
 						bot.tui.app.QueueUpdateDraw(func() {
 							bot.tui.chatView.Clear()
@@ -893,13 +1035,19 @@ func (bot *ChatBot) sendKeepAlive() {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		if bot.wsConn != nil {
+		if bot.isConnectionHealthy() {
 			bot.wsMutex.Lock()
 			bot.wsConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 			if err := bot.wsConn.WriteMessage(websocket.PingMessage, []byte("keepalive")); err != nil {
 				bot.log("❌ Failed to send ping: %v", err)
+				// Mark connection as unhealthy on ping failure
+				bot.setConnectionStatus(false)
+			} else {
+				bot.log("💓 Keep-alive ping sent successfully")
 			}
 			bot.wsMutex.Unlock()
+		} else {
+			bot.log("⚠️ Skipping keep-alive ping - connection not healthy")
 		}
 	}
 }
@@ -920,6 +1068,10 @@ func (bot *ChatBot) Start() error {
 	if err := bot.connectWebSocket(); err != nil {
 		return fmt.Errorf("WebSocket connection failed: %v", err)
 	}
+
+	// Mark as connected after successful connection
+	bot.setConnectionStatus(true)
+	bot.lastReconnect = time.Now()
 
 	bot.log("👂 Step 3: Starting message listener...")
 	bot.tui.UpdateStatus("Starting message listener...")
