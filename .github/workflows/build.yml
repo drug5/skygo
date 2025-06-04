@@ -1,7 +1,6 @@
-# GitHub Actions Workflow for skyGO
+# GitHub Actions Workflow for skyGO - Updated versions
 name: Build skyGO
 
-# Trigger events
 on:
   push:
     branches: [ main, develop ]
@@ -9,15 +8,13 @@ on:
     branches: [ main ]
   release:
     types: [ created ]
-  workflow_dispatch: # Allow manual triggers
+  workflow_dispatch:
 
-# Environment variables
 env:
   GO_VERSION: '1.21'
   PROJECT_NAME: 'skyGO'
 
 jobs:
-  # Test job
   test:
     name: Test
     runs-on: ubuntu-latest
@@ -26,12 +23,12 @@ jobs:
       uses: actions/checkout@v4
 
     - name: Set up Go
-      uses: actions/setup-go@v4
+      uses: actions/setup-go@v5
       with:
         go-version: ${{ env.GO_VERSION }}
 
     - name: Cache Go modules
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: |
           ~/.cache/go-build
@@ -49,7 +46,6 @@ jobs:
         go vet $(go list ./... | grep -v /vendor/)
         go test -race -coverprofile=coverage.out -covermode=atomic ./...
 
-  # Build job
   build:
     name: Build Binaries
     runs-on: ubuntu-latest
@@ -72,12 +68,12 @@ jobs:
       uses: actions/checkout@v4
 
     - name: Set up Go
-      uses: actions/setup-go@v4
+      uses: actions/setup-go@v5
       with:
         go-version: ${{ env.GO_VERSION }}
 
     - name: Cache Go modules
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: |
           ~/.cache/go-build
@@ -95,23 +91,20 @@ jobs:
         GOARCH: ${{ matrix.goarch }}
         CGO_ENABLED: 0
       run: |
-        # Create build info
         BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
         VERSION=${GITHUB_REF_NAME:-$GITHUB_SHA}
         
-        # Build with optimizations
         go build -ldflags="-s -w -X main.version=${VERSION} -X main.buildTime=${BUILD_TIME}" \
           -o ${{ env.PROJECT_NAME }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }} \
           main.go
 
     - name: Upload artifact
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: ${{ env.PROJECT_NAME }}-${{ matrix.goos }}-${{ matrix.goarch }}
         path: ${{ env.PROJECT_NAME }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}
         retention-days: 30
 
-  # Release job (only for tags)
   release:
     name: Create Release
     runs-on: ubuntu-latest
@@ -123,14 +116,14 @@ jobs:
       uses: actions/checkout@v4
 
     - name: Download all artifacts
-      uses: actions/download-artifact@v3
+      uses: actions/download-artifact@v4
       with:
         path: ./artifacts
 
     - name: Prepare release assets
       run: |
         mkdir -p release
-        find ./artifacts -type f -executable -o -name "*.exe" | while read file; do
+        find ./artifacts -type f \( -executable -o -name "*.exe" \) | while read file; do
           cp "$file" "./release/"
         done
         ls -la release/
