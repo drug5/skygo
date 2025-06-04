@@ -799,6 +799,27 @@ func (bot *ChatBot) listenForMessages() {
 									bot.log("👤 User joined: %s", username)
 								}
 							}
+
+							// Handle chat messages from events within client updates
+							if events, eventsOk := client["events"].([]interface{}); eventsOk {
+								for _, event := range events {
+									if eventData, eventOk := event.(map[string]interface{}); eventOk {
+										if eventType, typeOk := eventData["type"].(string); typeOk && eventType == "chat" {
+											if data, dataOk := eventData["data"].(map[string]interface{}); dataOk {
+												if username, usernameOk := data["username"].(string); usernameOk {
+													if message, messageOk := data["message"].(string); messageOk {
+														bot.log("💬 Chat [%s]: %s", username, message)
+														// Don't display your own messages again (they're already shown when sent)
+														if username != bot.username {
+															bot.tui.AddChatMessage("", username, message)
+														}
+													}
+												}
+											}
+										}
+									}
+								}
+							}
 						}
 					}
 				}
@@ -874,21 +895,27 @@ func (bot *ChatBot) listenForMessages() {
 				}
 			}
 
-			// Handle chat messages - display in chat pane
+			// Handle chat messages - display in chat pane (legacy format, keeping for compatibility)
 			if msgType, ok := messageData["type"].(string); ok && (msgType == "chat" || msgType == "message") {
 				if data, dataOk := messageData["data"].(map[string]interface{}); dataOk {
 					username, _ := data["username"].(string)
 					chatMsg, _ := data["message"].(string)
 					if username != "" && chatMsg != "" {
 						bot.log("💬 Chat [%s]: %s", username, chatMsg)
-						bot.tui.AddChatMessage("", username, chatMsg)
+						// Don't display your own messages again (they're already shown when sent)
+						if username != bot.username {
+							bot.tui.AddChatMessage("", username, chatMsg)
+						}
 					}
 				}
 			}
 			if user, userOk := messageData["user"].(string); userOk {
 				if text, textOk := messageData["text"].(string); textOk {
 					bot.log("💬 Chat [%s]: %s", user, text)
-					bot.tui.AddChatMessage("", user, text)
+					// Don't display your own messages again (they're already shown when sent)
+					if user != bot.username {
+						bot.tui.AddChatMessage("", user, text)
+					}
 				}
 			}
 		} else {
