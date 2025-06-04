@@ -10,7 +10,6 @@ import (
         "strconv"
         "strings"
         "sync"
-        "sync/atomic"
         "syscall"
         "time"
 
@@ -43,8 +42,9 @@ type TUI struct {
         userMutex    sync.Mutex
         users        map[string]bool
         currentRoom  string
-        onlineHours  int32  // Use atomic
-        onlineMinutes int32 // Use atomic
+        onlineHours  int
+        onlineMinutes int
+        onlineTimeMutex sync.RWMutex
         // File logging
         chatLogFile *os.File
         rawLogFile  *os.File
@@ -55,17 +55,6 @@ type TUI struct {
         historyIndex    int
         currentInput    string
         historyMutex    sync.Mutex
-        // Performance optimizations
-        logChan         chan string      // Async logging
-        chatChan        chan ChatMessage // Async chat messages
-        updateChan      chan func()      // Async UI updates
-}
-
-// ChatMessage represents a chat message for async processing
-type ChatMessage struct {
-        Timestamp string
-        Username  string
-        Message   string
 }
 
 // ChatBot represents the chat bot instance
@@ -80,44 +69,29 @@ type ChatBot struct {
         messageInterval time.Duration
         messages        []string
         currentMsgIndex int
-        wsMutex         sync.RWMutex // Use RWMutex for better read performance
+        wsMutex         sync.Mutex
         currentRoom     string
         currentRoomName string
         messageTimer    *time.Timer
         timerMutex      sync.Mutex
         tui             *TUI
-        isConnected     int32 // Use atomic for connection status
+        isConnected     bool
         connMutex       sync.RWMutex
         reconnectCount  int
         lastReconnect   time.Time
-        // Autopick functionality
-        autopickEnabled int32 // Use atomic
-        userPositions   sync.Map // Use sync.Map for better concurrent access
-        droppedItems    sync.Map // Use sync.Map for better concurrent access
-        ownPosition     Position
-        positionMutex   sync.RWMutex
-        // Room fields - optimized
-        roomFields      []RoomField
-        availableCache  []Position // Cache available positions
+        // Autopick functionality - updated to use client IDs
+        autopickEnabled bool
+        autopickMutex   sync.RWMutex
+        clientIDToUsername map[int]string    // Track client ID to username mapping
+        clientPositions    map[int]Position  // Track positions by client ID
+        droppedItems       map[int]DroppedItem // Track dropped items by ID
+        ownClientID        int              // Track our own client ID
+        ownPosition        Position         // Track our own position
+        positionMutex      sync.RWMutex
+        clientMutex        sync.RWMutex
+        // Room fields
+        roomFields      []RoomField        // Available fields in current room
         fieldsMutex     sync.RWMutex
-        cacheValid      int32 // Atomic flag for cache validity
-        // Performance monitoring
-        moveQueue       chan MoveCommand     // Buffered channel for move commands
-        actionQueue     chan ActionCommand   // Buffered channel for actions
-        fastMode        int32               // Atomic flag for fast mode
-}
-
-// MoveCommand represents a move operation
-type MoveCommand struct {
-        X, Y int
-        Callback func(error)
-}
-
-// ActionCommand represents an action operation
-type ActionCommand struct {
-        Type string
-        Data interface{}
-        Callback func(error)
 }
 
 // Position represents x,y coordinates
@@ -128,11 +102,12 @@ type Position struct {
 
 // DroppedItem represents an item that was dropped and needs to be picked up
 type DroppedItem struct {
-        ID       int      `json:"id"`
-        Name     string   `json:"name"`
-        Position Position `json:"position"`
-        DroppedBy string  `json:"droppedBy"`
-        DroppedAt time.Time `json:"droppedAt"`
+        ID               int      `json:"id"`
+        Name             string   `json:"name"`
+        Position         Position `json:"position"`
+        DroppedByClientID int     `json:"droppedByClientID"`
+        DroppedByUsername string  `json:"droppedByUsername"`
+        DroppedAt        time.Time `json:"droppedAt"`
 }
 
 // RoomField represents a field in the room that can potentially be moved to
@@ -143,7 +118,7 @@ type RoomField struct {
         IsWalkable bool   `json:"isWalkable"`
 }
 
-// NewTUI creates a new terminal user interface with performance optimizations
+// NewTUI creates a new terminal user interface
 func NewTUI() *TUI {
         tui := &TUI{
                 app:   tview.NewApplication(),
@@ -152,10 +127,6 @@ func NewTUI() *TUI {
                 inputHistory: make([]string, 0),
                 historyIndex: 0,
                 currentInput: "",
-                // Performance channels
-                logChan:    make(chan string, 1000),      // Large buffer for async logging
-                chatChan:   make(chan ChatMessage, 500),  // Buffer for chat messages
-                updateChan: make(chan func(), 100),       // Buffer for UI updates
         }
 
         // Setup logging first
@@ -165,11 +136,6 @@ func NewTUI() *TUI {
         } else {
                 fmt.Println("📁 Logging initialized - saving to logs/ directory")
         }
-
-        // Start async processors
-        go tui.processLogs()
-        go tui.processChatMessages()
-        go tui.processUIUpdates()
 
         // Create the main components
         tui.chatView = tview.NewTextView().
@@ -231,76 +197,54 @@ func NewTUI() *TUI {
         return tui
 }
 
-// processLogs handles async log processing
-func (tui *TUI) processLogs() {
-        for logMsg := range tui.logChan {
-                tui.writeToRawLog(logMsg)
-                
-                tui.app.QueueUpdateDraw(func() {
-                        tui.logMutex.Lock()
-                        timeStr := time.Now().Format("15:04:05.000")
-                        formattedMsg := fmt.Sprintf("[gray]%s[white] %s\n", timeStr, logMsg)
-                        fmt.Fprint(tui.logView, formattedMsg)
-                        tui.logView.ScrollToEnd()
-                        tui.logMutex.Unlock()
-                })
-        }
-}
-
-// processChatMessages handles async chat message processing
-func (tui *TUI) processChatMessages() {
-        for msg := range tui.chatChan {
-                tui.writeToChatLog(msg.Timestamp, msg.Username, msg.Message)
-                
-                tui.app.QueueUpdateDraw(func() {
-                        tui.chatMutex.Lock()
-                        timeStr := msg.Timestamp
-                        if timeStr == "" {
-                                timeStr = time.Now().Format("15:04:05")
-                        }
-
-                        var formattedMsg string
-                        if msg.Username != "" {
-                                formattedMsg = fmt.Sprintf("[gray]%s[white] [yellow]<%s>[white] %s\n", timeStr, msg.Username, msg.Message)
-                        } else {
-                                formattedMsg = fmt.Sprintf("[gray]%s[white] [blue]***[white] %s\n", timeStr, msg.Message)
-                        }
-
-                        fmt.Fprint(tui.chatView, formattedMsg)
-                        tui.chatView.ScrollToEnd()
-                        tui.chatMutex.Unlock()
-                })
-        }
-}
-
-// processUIUpdates handles async UI updates
-func (tui *TUI) processUIUpdates() {
-        for updateFunc := range tui.updateChan {
-                tui.app.QueueUpdateDraw(updateFunc)
-        }
-}
-
-// AddChatMessage adds a formatted chat message to the chat pane (async)
+// AddChatMessage adds a formatted chat message to the chat pane
 func (tui *TUI) AddChatMessage(timestamp, username, message string) {
-        select {
-        case tui.chatChan <- ChatMessage{Timestamp: timestamp, Username: username, Message: message}:
-        default:
-                // Channel full, skip to avoid blocking
-        }
+        // Write to log file first
+        tui.writeToChatLog(timestamp, username, message)
+
+        // Then update the UI
+        tui.app.QueueUpdateDraw(func() {
+                tui.chatMutex.Lock()
+                defer tui.chatMutex.Unlock()
+
+                timeStr := timestamp
+                if timeStr == "" {
+                        timeStr = time.Now().Format("15:04:05")
+                }
+
+                var formattedMsg string
+                if username != "" {
+                        formattedMsg = fmt.Sprintf("[gray]%s[white] [yellow]<%s>[white] %s\n", timeStr, username, message)
+                } else {
+                        formattedMsg = fmt.Sprintf("[gray]%s[white] [blue]***[white] %s\n", timeStr, message)
+                }
+
+                fmt.Fprint(tui.chatView, formattedMsg)
+                tui.chatView.ScrollToEnd()
+        })
 }
 
-// AddLogMessage adds a log message to the log pane (async)
+// AddLogMessage adds a log message to the log pane
 func (tui *TUI) AddLogMessage(message string) {
-        select {
-        case tui.logChan <- message:
-        default:
-                // Channel full, skip to avoid blocking
-        }
+        // Write to log file first
+        tui.writeToRawLog(message)
+
+        // Then update the UI
+        tui.app.QueueUpdateDraw(func() {
+                tui.logMutex.Lock()
+                defer tui.logMutex.Unlock()
+
+                timeStr := time.Now().Format("15:04:05.000")
+                formattedMsg := fmt.Sprintf("[gray]%s[white] %s\n", timeStr, message)
+
+                fmt.Fprint(tui.logView, formattedMsg)
+                tui.logView.ScrollToEnd()
+        })
 }
 
 // UpdateUsers updates the user list in the user pane
 func (tui *TUI) UpdateUsers(users []string) {
-        updateFunc := func() {
+        tui.app.QueueUpdateDraw(func() {
                 tui.userMutex.Lock()
                 defer tui.userMutex.Unlock()
 
@@ -310,14 +254,7 @@ func (tui *TUI) UpdateUsers(users []string) {
                 for _, user := range users {
                         fmt.Fprintf(tui.userView, "[green]● [white]%s\n", user)
                 }
-        }
-        
-        select {
-        case tui.updateChan <- updateFunc:
-        default:
-                // Channel full, execute directly
-                tui.app.QueueUpdateDraw(updateFunc)
-        }
+        })
 }
 
 // AddUser adds a user to the current room
@@ -562,11 +499,6 @@ func (tui *TUI) closeLogFiles() {
                 tui.rawLogFile.Close()
                 tui.rawLogFile = nil
         }
-
-        // Close async channels
-        close(tui.logChan)
-        close(tui.chatChan)
-        close(tui.updateChan)
 }
 
 // SetRoom updates the current room and clears users
@@ -591,20 +523,24 @@ func (tui *TUI) SetRoomUsers(usernames []string) {
         tui.UpdateUsers(usernames)
 }
 
-// UpdateOnlineTime updates the tracked online time from server data (atomic)
+// UpdateOnlineTime updates the tracked online time from server data
 func (tui *TUI) UpdateOnlineTime(hours, minutes int) {
-        atomic.StoreInt32(&tui.onlineHours, int32(hours))
-        atomic.StoreInt32(&tui.onlineMinutes, int32(minutes))
+        tui.onlineTimeMutex.Lock()
+        tui.onlineHours = hours
+        tui.onlineMinutes = minutes
+        tui.onlineTimeMutex.Unlock()
 }
 
-// GetOnlineTime returns the current online time (atomic)
+// GetOnlineTime returns the current online time
 func (tui *TUI) GetOnlineTime() (int, int) {
-        return int(atomic.LoadInt32(&tui.onlineHours)), int(atomic.LoadInt32(&tui.onlineMinutes))
+        tui.onlineTimeMutex.RLock()
+        defer tui.onlineTimeMutex.RUnlock()
+        return tui.onlineHours, tui.onlineMinutes
 }
 
 // UpdateStatusBar updates the comprehensive status bar with all information
 func (tui *TUI) UpdateStatusBar(username string, connected bool, roomName, roomID, autopickStatus string) {
-        updateFunc := func() {
+        tui.app.QueueUpdateDraw(func() {
                 currentTime := time.Now().Format("15:04:05")
 
                 var connStatus string
@@ -629,14 +565,7 @@ func (tui *TUI) UpdateStatusBar(username string, connected bool, roomName, roomI
 
                 tui.statusBar.Clear()
                 fmt.Fprint(tui.statusBar, statusText)
-        }
-        
-        select {
-        case tui.updateChan <- updateFunc:
-        default:
-                // Channel full, execute directly
-                tui.app.QueueUpdateDraw(updateFunc)
-        }
+        })
 }
 
 // Run starts the TUI application
@@ -697,9 +626,9 @@ func loadConfig(configPath string) (*Config, error) {
         return &config, nil
 }
 
-// NewChatBot creates a new ChatBot instance with performance optimizations
+// NewChatBot creates a new ChatBot instance
 func NewChatBot(config *Config, tui *TUI) *ChatBot {
-        bot := &ChatBot{
+        return &ChatBot{
                 username:        config.Username,
                 password:        config.Password,
                 baseURL:         config.BaseURL,
@@ -711,61 +640,21 @@ func NewChatBot(config *Config, tui *TUI) *ChatBot {
                 messages:        config.Messages,
                 currentMsgIndex: 0,
                 tui:             tui,
+                isConnected:     false,
                 reconnectCount:  0,
-                ownPosition:     Position{X: 0, Y: 0},
-                roomFields:      make([]RoomField, 0),
-                availableCache:  make([]Position, 0),
-                // Performance queues
-                moveQueue:   make(chan MoveCommand, 100),   // Buffered move queue
-                actionQueue: make(chan ActionCommand, 100), // Buffered action queue
-        }
-
-        // Start async processors
-        go bot.processMoveQueue()
-        go bot.processActionQueue()
-
-        return bot
-}
-
-// processMoveQueue processes move commands asynchronously
-func (bot *ChatBot) processMoveQueue() {
-        for moveCmd := range bot.moveQueue {
-                err := bot.moveToPositionDirect(moveCmd.X, moveCmd.Y)
-                if moveCmd.Callback != nil {
-                        moveCmd.Callback(err)
-                }
-                
-                // Fast mode: minimal delay between moves
-                if atomic.LoadInt32(&bot.fastMode) > 0 {
-                        time.Sleep(25 * time.Millisecond) // Ultra-fast mode
-                } else {
-                        time.Sleep(50 * time.Millisecond) // Normal fast mode
-                }
+                // Initialize autopick with client ID tracking
+                autopickEnabled:    false,
+                clientIDToUsername: make(map[int]string),
+                clientPositions:    make(map[int]Position),
+                droppedItems:       make(map[int]DroppedItem),
+                ownClientID:        0,
+                ownPosition:        Position{X: 0, Y: 0},
+                // Initialize room fields
+                roomFields:         make([]RoomField, 0),
         }
 }
 
-// processActionQueue processes action commands asynchronously  
-func (bot *ChatBot) processActionQueue() {
-        for actionCmd := range bot.actionQueue {
-                var err error
-                switch actionCmd.Type {
-                case "pickup":
-                        if itemID, ok := actionCmd.Data.(int); ok {
-                                err = bot.pickupItemDirect(itemID)
-                        }
-                case "chat":
-                        if message, ok := actionCmd.Data.(string); ok {
-                                err = bot.sendMessageDirect(message)
-                        }
-                }
-                
-                if actionCmd.Callback != nil {
-                        actionCmd.Callback(err)
-                }
-        }
-}
-
-// log is a helper function to log to the TUI instead of stdout (async)
+// log is a helper function to log to the TUI instead of stdout
 func (bot *ChatBot) log(format string, args ...interface{}) {
         message := fmt.Sprintf(format, args...)
         if bot.tui != nil {
@@ -773,14 +662,13 @@ func (bot *ChatBot) log(format string, args ...interface{}) {
         }
 }
 
-// setConnectionStatus safely updates connection status (atomic)
+// setConnectionStatus safely updates connection status
 func (bot *ChatBot) setConnectionStatus(connected bool) {
-        var connValue int32
-        if connected {
-                connValue = 1
-        }
-        
-        wasConnected := atomic.SwapInt32(&bot.isConnected, connValue) == 1
+        bot.connMutex.Lock()
+        defer bot.connMutex.Unlock()
+
+        wasConnected := bot.isConnected
+        bot.isConnected = connected
 
         if connected && !wasConnected {
                 bot.reconnectCount = 0
@@ -792,23 +680,48 @@ func (bot *ChatBot) setConnectionStatus(connected bool) {
         }
 }
 
-// isConnectionHealthy checks if connection is healthy (atomic)
-func (bot *ChatBot) isConnectionHealthy() bool {
-        return atomic.LoadInt32(&bot.isConnected) == 1 && bot.wsConn != nil
-}
-
-// isAutopickEnabled safely checks if autopick is enabled (atomic)
-func (bot *ChatBot) isAutopickEnabled() bool {
-        return atomic.LoadInt32(&bot.autopickEnabled) == 1
-}
-
-// setAutopickEnabled safely sets autopick status (atomic)
-func (bot *ChatBot) setAutopickEnabled(enabled bool) {
-        var value int32
-        if enabled {
-                value = 1
+// Client ID management methods
+func (bot *ChatBot) setClientUsername(clientID int, username string) {
+        bot.clientMutex.Lock()
+        defer bot.clientMutex.Unlock()
+        bot.clientIDToUsername[clientID] = username
+        
+        // If this is our username, store our client ID
+        if username == bot.username {
+                bot.ownClientID = clientID
+                bot.log("🆔 Our client ID is: %d", clientID)
         }
-        atomic.StoreInt32(&bot.autopickEnabled, value)
+}
+
+func (bot *ChatBot) getClientUsername(clientID int) (string, bool) {
+        bot.clientMutex.RLock()
+        defer bot.clientMutex.RUnlock()
+        username, exists := bot.clientIDToUsername[clientID]
+        return username, exists
+}
+
+func (bot *ChatBot) removeClient(clientID int) {
+        bot.clientMutex.Lock()
+        defer bot.clientMutex.Unlock()
+        delete(bot.clientIDToUsername, clientID)
+        
+        bot.positionMutex.Lock()
+        delete(bot.clientPositions, clientID)
+        bot.positionMutex.Unlock()
+}
+
+// isAutopickEnabled safely checks if autopick is enabled
+func (bot *ChatBot) isAutopickEnabled() bool {
+        bot.autopickMutex.RLock()
+        defer bot.autopickMutex.RUnlock()
+        return bot.autopickEnabled
+}
+
+// setAutopickEnabled safely sets autopick status
+func (bot *ChatBot) setAutopickEnabled(enabled bool) {
+        bot.autopickMutex.Lock()
+        bot.autopickEnabled = enabled
+        bot.autopickMutex.Unlock()
 
         status := "DISABLED"
         if enabled {
@@ -818,252 +731,193 @@ func (bot *ChatBot) setAutopickEnabled(enabled bool) {
         bot.updateFullStatus()
 }
 
-// enableFastMode enables ultra-fast operation mode
-func (bot *ChatBot) enableFastMode(enabled bool) {
-        var value int32
-        if enabled {
-                value = 1
-        }
-        atomic.StoreInt32(&bot.fastMode, value)
+// updateClientPosition updates a client's position by ID
+func (bot *ChatBot) updateClientPosition(clientID int, x, y int) {
+        bot.positionMutex.Lock()
+        defer bot.positionMutex.Unlock()
         
-        mode := "NORMAL"
-        if enabled {
-                mode = "ULTRA-FAST"
-        }
-        bot.log("🚀 Performance mode: %s", mode)
-}
-
-// updateUserPosition updates a user's position (optimized with sync.Map)
-func (bot *ChatBot) updateUserPosition(username string, x, y int) {
-        pos := Position{X: x, Y: y}
+        oldPos, hadPosition := bot.clientPositions[clientID]
+        bot.clientPositions[clientID] = Position{X: x, Y: y}
         
-        if username == bot.username {
-                bot.positionMutex.Lock()
-                bot.ownPosition = pos
-                bot.positionMutex.Unlock()
+        if clientID == bot.ownClientID {
+                bot.ownPosition = Position{X: x, Y: y}
                 bot.log("📍 Own position updated: (%d, %d)", x, y)
-                
-                // Invalidate position cache
-                atomic.StoreInt32(&bot.cacheValid, 0)
         } else {
-                if bot.isAutopickEnabled() {
-                        // Check if user moved and handle item opportunities
-                        if oldPosVal, exists := bot.userPositions.LoadAndDelete(username); exists {
-                                if oldPos, ok := oldPosVal.(Position); ok && (oldPos.X != x || oldPos.Y != y) {
-                                        go bot.checkItemOpportunitiesFast(username, oldPos)
-                                }
-                        }
+                // Check if this client has any items they dropped and moved away from
+                if bot.isAutopickEnabled() && hadPosition && (oldPos.X != x || oldPos.Y != y) {
+                        go bot.checkItemOpportunitiesForClient(clientID, oldPos)
                 }
-                bot.userPositions.Store(username, pos)
-                
-                // Invalidate position cache
-                atomic.StoreInt32(&bot.cacheValid, 0)
         }
 }
 
-// checkItemOpportunitiesFast optimized version for faster item pickup
-func (bot *ChatBot) checkItemOpportunitiesFast(username string, oldPos Position) {
+// checkItemOpportunitiesForClient checks if client movement creates pickup opportunities
+func (bot *ChatBot) checkItemOpportunitiesForClient(clientID int, oldPos Position) {
+        // Check all tracked items to see if this client moved away from any
+        bot.positionMutex.RLock()
         var itemsToCheck []DroppedItem
-        
-        // Collect items to check
-        bot.droppedItems.Range(func(key, value interface{}) bool {
-                if item, ok := value.(DroppedItem); ok {
-                        if item.DroppedBy == username && item.Position.X == oldPos.X && item.Position.Y == oldPos.Y {
-                                itemsToCheck = append(itemsToCheck, item)
-                        }
+        for _, item := range bot.droppedItems {
+                if item.DroppedByClientID == clientID && item.Position.X == oldPos.X && item.Position.Y == oldPos.Y {
+                        itemsToCheck = append(itemsToCheck, item)
                 }
-                return true
-        })
+        }
+        bot.positionMutex.RUnlock()
 
-        // Process items with minimal delay
+        // Get username for logging
+        username, _ := bot.getClientUsername(clientID)
+        if username == "" {
+                username = fmt.Sprintf("Client_%d", clientID)
+        }
+
+        // Immediately attempt to pick up items the client moved away from
         for _, item := range itemsToCheck {
-                bot.log("⚡ User %s moved away from %s, immediate pickup attempt", username, item.Name)
+                bot.log("⚡ %s (ID:%d) moved away from %s, immediate pickup attempt", username, clientID, item.Name)
 
-                // Queue move and pickup as fast as possible
-                moveDone := make(chan error, 1)
-                bot.queueMove(item.Position.X, item.Position.Y, func(err error) {
-                        moveDone <- err
-                })
-
-                // Wait for move with timeout
-                select {
-                case err := <-moveDone:
-                        if err != nil {
-                                bot.log("❌ Failed to move to item position: %v", err)
-                                continue
-                        }
-                case <-time.After(200 * time.Millisecond):
-                        bot.log("⏱️ Move timeout for item %s", item.Name)
+                // Move to the item position immediately
+                if err := bot.moveToPosition(item.Position.X, item.Position.Y); err != nil {
+                        bot.log("❌ Failed to move to item position: %v", err)
                         continue
                 }
 
-                // Minimal wait then pickup
-                time.Sleep(25 * time.Millisecond)
+                // Wait for movement command to be processed before pickup
+                time.Sleep(500 * time.Millisecond)
 
-                pickupDone := make(chan error, 1)
-                bot.queueAction("pickup", item.ID, func(err error) {
-                        pickupDone <- err
-                })
-
-                // Wait for pickup
-                select {
-                case err := <-pickupDone:
-                        if err != nil {
-                                bot.log("❌ Failed to pick up item: %v", err)
-                                continue
-                        }
-                case <-time.After(200 * time.Millisecond):
-                        bot.log("⏱️ Pickup timeout for item %s", item.Name)
+                // Pick up the item immediately
+                if err := bot.pickupItem(item.ID); err != nil {
+                        bot.log("❌ Failed to pick up item: %v", err)
                         continue
                 }
 
-                // Remove from tracking
-                bot.droppedItems.Delete(item.ID)
+                // Remove from our tracked items
+                bot.positionMutex.Lock()
+                delete(bot.droppedItems, item.ID)
+                bot.positionMutex.Unlock()
+
                 bot.log("✅ Successfully picked up %s (ID:%d)", item.Name, item.ID)
                 bot.tui.AddChatMessage("", "", fmt.Sprintf("🤖 Autopicked: %s", item.Name))
-                break // Only pick up one item at a time
+
+                // Only pick up one item at a time
+                break
         }
 }
 
-// queueMove queues a move command for async processing
-func (bot *ChatBot) queueMove(x, y int, callback func(error)) {
-        select {
-        case bot.moveQueue <- MoveCommand{X: x, Y: y, Callback: callback}:
-        default:
-                // Queue full, execute directly
-                go func() {
-                        err := bot.moveToPositionDirect(x, y)
-                        if callback != nil {
-                                callback(err)
-                        }
-                }()
-        }
-}
-
-// queueAction queues an action command for async processing
-func (bot *ChatBot) queueAction(actionType string, data interface{}, callback func(error)) {
-        select {
-        case bot.actionQueue <- ActionCommand{Type: actionType, Data: data, Callback: callback}:
-        default:
-                // Queue full, execute directly based on type
-                go func() {
-                        var err error
-                        switch actionType {
-                        case "pickup":
-                                if itemID, ok := data.(int); ok {
-                                        err = bot.pickupItemDirect(itemID)
-                                }
-                        case "chat":
-                                if message, ok := data.(string); ok {
-                                        err = bot.sendMessageDirect(message)
-                                }
-                        }
-                        if callback != nil {
-                                callback(err)
-                        }
-                }()
-        }
-}
-
-// handleItemDropped processes when an item is dropped by a user (optimized)
-func (bot *ChatBot) handleItemDropped(itemID int, itemName string, x, y int, droppedByUsername string) {
+// handleItemDropped processes when an item is dropped by a client
+func (bot *ChatBot) handleItemDropped(itemID int, itemName string, x, y int, droppedByClientID int) {
         if !bot.isAutopickEnabled() {
                 return
         }
 
-        droppedItem := DroppedItem{
-                ID:       itemID,
-                Name:     itemName,
-                Position: Position{X: x, Y: y},
-                DroppedBy: droppedByUsername,
-                DroppedAt: time.Now(),
+        // Get username for this client ID
+        username, _ := bot.getClientUsername(droppedByClientID)
+        if username == "" {
+                username = fmt.Sprintf("Client_%d", droppedByClientID)
         }
 
-        bot.droppedItems.Store(itemID, droppedItem)
-        bot.log("📦 Item dropped: %s (ID:%d) at (%d,%d) by %s", itemName, itemID, x, y, droppedByUsername)
+        bot.positionMutex.Lock()
+        defer bot.positionMutex.Unlock()
 
-        // Start ultra-fast monitoring
-        go bot.monitorDroppedItemUltraFast(droppedItem)
+        // Store the dropped item with client ID
+        droppedItem := DroppedItem{
+                ID:               itemID,
+                Name:             itemName,
+                Position:         Position{X: x, Y: y},
+                DroppedByClientID: droppedByClientID,
+                DroppedByUsername: username,
+                DroppedAt:        time.Now(),
+        }
+
+        bot.droppedItems[itemID] = droppedItem
+        bot.log("📦 Item dropped: %s (ID:%d) at (%d,%d) by %s (ClientID:%d)", itemName, itemID, x, y, username, droppedByClientID)
+
+        // Start monitoring this item for pickup opportunity
+        go bot.monitorDroppedItemByClientID(droppedItem)
 }
 
-// monitorDroppedItemUltraFast watches a dropped item with ultra-minimal delays
-func (bot *ChatBot) monitorDroppedItemUltraFast(item DroppedItem) {
-        // Ultra-short initial wait
-        time.Sleep(25 * time.Millisecond)
+// monitorDroppedItemByClientID watches a dropped item with client ID tracking
+func (bot *ChatBot) monitorDroppedItemByClientID(item DroppedItem) {
+        // Short initial wait to allow for position updates to propagate
+        time.Sleep(100 * time.Millisecond)
 
-        maxWaitTime := 3 * time.Second // Reduced from 5 seconds
+        maxWaitTime := 5 * time.Second
         startTime := time.Now()
-        checkInterval := 25 * time.Millisecond // Ultra-fast checking
+        checkInterval := 50 * time.Millisecond
 
         for time.Since(startTime) < maxWaitTime {
                 // Check if item still exists
-                if _, exists := bot.droppedItems.Load(item.ID); !exists {
+                bot.positionMutex.RLock()
+                _, exists := bot.droppedItems[item.ID]
+                bot.positionMutex.RUnlock()
+
+                if !exists {
+                        bot.log("📦 Item %s (ID:%d) no longer available", item.Name, item.ID)
                         return
                 }
 
-                // Check if dropper moved away
-                dropperPosVal, dropperExists := bot.userPositions.Load(item.DroppedBy)
-                
-                if !dropperExists {
-                        // Dropper disappeared, immediate pickup
-                        bot.executeImmediatePickup(item)
-                        return
-                }
+                // Check if the dropper is still at the item position
+                bot.positionMutex.RLock()
+                dropperPos, dropperExists := bot.clientPositions[item.DroppedByClientID]
+                bot.positionMutex.RUnlock()
 
-                if dropperPos, ok := dropperPosVal.(Position); ok {
-                        if dropperPos.X != item.Position.X || dropperPos.Y != item.Position.Y {
-                                // Dropper moved, immediate pickup
-                                bot.executeImmediatePickup(item)
+                // If dropper moved away or is no longer visible, attempt pickup
+                if !dropperExists || (dropperPos.X != item.Position.X || dropperPos.Y != item.Position.Y) {
+                        bot.log("🏃 %s (ClientID:%d) moved away from %s, attempting pickup", item.DroppedByUsername, item.DroppedByClientID, item.Name)
+
+                        // Move to the item position
+                        if err := bot.moveToPosition(item.Position.X, item.Position.Y); err != nil {
+                                bot.log("❌ Failed to move to item position: %v", err)
                                 return
                         }
+
+                        // Wait for movement to be processed before pickup
+                        time.Sleep(500 * time.Millisecond)
+
+                        // Pick up the item
+                        if err := bot.pickupItem(item.ID); err != nil {
+                                bot.log("❌ Failed to pick up item: %v", err)
+                                return
+                        }
+
+                        // Remove from tracking
+                        bot.positionMutex.Lock()
+                        delete(bot.droppedItems, item.ID)
+                        bot.positionMutex.Unlock()
+
+                        bot.log("✅ Successfully picked up %s (ID:%d)", item.Name, item.ID)
+                        bot.tui.AddChatMessage("", "", fmt.Sprintf("🤖 Autopicked: %s", item.Name))
+                        return
                 }
 
+                // Client still at item position, wait and check again
                 time.Sleep(checkInterval)
         }
 
-        bot.log("⏱️ Ultra-fast timeout for %s", item.Name)
+        // Timeout reached
+        bot.log("⏱️ Timeout waiting for %s (ClientID:%d) to move away from %s", item.DroppedByUsername, item.DroppedByClientID, item.Name)
 }
 
-// executeImmediatePickup performs immediate pickup with minimal delays
-func (bot *ChatBot) executeImmediatePickup(item DroppedItem) {
-        bot.log("🏃 User %s moved away from %s, executing immediate pickup", item.DroppedBy, item.Name)
-
-        // Ultra-fast move
-        if err := bot.moveToPositionDirect(item.Position.X, item.Position.Y); err != nil {
-                bot.log("❌ Failed to move to item position: %v", err)
-                return
-        }
-
-        // Minimal wait
-        time.Sleep(50 * time.Millisecond)
-
-        // Ultra-fast pickup
-        if err := bot.pickupItemDirect(item.ID); err != nil {
-                bot.log("❌ Failed to pick up item: %v", err)
-                return
-        }
-
-        bot.droppedItems.Delete(item.ID)
-        bot.log("✅ Successfully picked up %s (ID:%d)", item.Name, item.ID)
-        bot.tui.AddChatMessage("", "", fmt.Sprintf("🤖 Autopicked: %s", item.Name))
-}
-
-// handleItemPickedUp processes when an item is picked up (optimized)
+// handleItemPickedUp processes when an item is picked up (removes from tracking)
 func (bot *ChatBot) handleItemPickedUp(itemID int) {
-        if itemVal, exists := bot.droppedItems.LoadAndDelete(itemID); exists {
-                if item, ok := itemVal.(DroppedItem); ok {
-                        bot.log("📦 Item %s (ID:%d) was picked up by someone", item.Name, itemID)
-                }
+        bot.positionMutex.Lock()
+        defer bot.positionMutex.Unlock()
+
+        if item, exists := bot.droppedItems[itemID]; exists {
+                delete(bot.droppedItems, itemID)
+                bot.log("📦 Item %s (ID:%d) was picked up by someone", item.Name, itemID)
         }
 }
 
-// moveToPositionDirect sends a move command directly (optimized)
-func (bot *ChatBot) moveToPositionDirect(x, y int) error {
+// moveToPosition sends a move command to the specified coordinates
+func (bot *ChatBot) moveToPosition(x, y int) error {
         if !bot.isConnectionHealthy() {
                 return fmt.Errorf("WebSocket connection not healthy")
         }
 
-        // Pre-marshal the move payload for better performance
+        bot.wsMutex.Lock()
+        defer bot.wsMutex.Unlock()
+
+        if bot.wsConn == nil {
+                return fmt.Errorf("WebSocket connection not established")
+        }
+
         movePayload := map[string]interface{}{
                 "type": "move",
                 "data": map[string]interface{}{
@@ -1077,48 +931,23 @@ func (bot *ChatBot) moveToPositionDirect(x, y int) error {
                 return fmt.Errorf("failed to marshal move command: %v", err)
         }
 
-        bot.wsMutex.Lock()
-        if bot.wsConn == nil {
-                bot.wsMutex.Unlock()
-                return fmt.Errorf("WebSocket connection not established")
-        }
-
-        // Reduced write deadline for faster operations
-        bot.wsConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+        bot.log("🚶 Moving to position (%d, %d)", x, y)
+        bot.wsConn.SetWriteDeadline(time.Now().Add(10 * time.Second))
         err = bot.wsConn.WriteMessage(websocket.TextMessage, msgBytes)
-        bot.wsMutex.Unlock()
-
         if err != nil {
                 bot.setConnectionStatus(false)
                 return fmt.Errorf("failed to send move command: %v", err)
         }
 
-        // Update position
-        bot.updateUserPosition(bot.username, x, y)
         return nil
 }
 
-// moveToPosition queued version for normal use
-func (bot *ChatBot) moveToPosition(x, y int) error {
-        done := make(chan error, 1)
-        bot.queueMove(x, y, func(err error) {
-                done <- err
-        })
-        
-        select {
-        case err := <-done:
-                return err
-        case <-time.After(1 * time.Second):
-                return fmt.Errorf("move operation timeout")
-        }
-}
-
-// parseRoomFields parses and stores the room field data (optimized)
+// parseRoomFields parses and stores the room field data
 func (bot *ChatBot) parseRoomFields(fieldsData []interface{}) {
         bot.fieldsMutex.Lock()
         defer bot.fieldsMutex.Unlock()
 
-        bot.roomFields = make([]RoomField, 0, len(fieldsData)) // Pre-allocate capacity
+        bot.roomFields = make([]RoomField, 0)
 
         for _, fieldData := range fieldsData {
                 if field, ok := fieldData.(map[string]interface{}); ok {
@@ -1141,41 +970,26 @@ func (bot *ChatBot) parseRoomFields(fieldsData []interface{}) {
                 }
         }
 
-        // Invalidate cache
-        atomic.StoreInt32(&bot.cacheValid, 0)
         bot.log("🗺️ Parsed %d room fields", len(bot.roomFields))
 }
 
-// getAvailablePositions returns cached or computed available positions
+// getAvailablePositions returns positions that are open, walkable, and not occupied
 func (bot *ChatBot) getAvailablePositions() []Position {
-        // Check if cache is valid
-        if atomic.LoadInt32(&bot.cacheValid) == 1 {
-                bot.fieldsMutex.RLock()
-                result := make([]Position, len(bot.availableCache))
-                copy(result, bot.availableCache)
-                bot.fieldsMutex.RUnlock()
-                return result
-        }
+        bot.fieldsMutex.RLock()
+        defer bot.fieldsMutex.RUnlock()
 
-        // Rebuild cache
-        bot.fieldsMutex.Lock()
-        defer bot.fieldsMutex.Unlock()
+        bot.positionMutex.RLock()
+        defer bot.positionMutex.RUnlock()
 
         var available []Position
+
+        // Get all occupied positions
         occupiedPositions := make(map[Position]bool)
-
-        // Collect occupied positions
-        bot.userPositions.Range(func(key, value interface{}) bool {
-                if pos, ok := value.(Position); ok {
-                        occupiedPositions[pos] = true
-                }
-                return true
-        })
-
-        // Add own position
-        bot.positionMutex.RLock()
+        for _, clientPos := range bot.clientPositions {
+                occupiedPositions[clientPos] = true
+        }
+        // Add our own position
         occupiedPositions[bot.ownPosition] = true
-        bot.positionMutex.RUnlock()
 
         // Find available fields
         for _, field := range bot.roomFields {
@@ -1186,11 +1000,6 @@ func (bot *ChatBot) getAvailablePositions() []Position {
                         }
                 }
         }
-
-        // Update cache
-        bot.availableCache = make([]Position, len(available))
-        copy(bot.availableCache, available)
-        atomic.StoreInt32(&bot.cacheValid, 1)
 
         return available
 }
@@ -1212,90 +1021,17 @@ func (bot *ChatBot) moveToRandomPosition() error {
         return bot.moveToPosition(targetPos.X, targetPos.Y)
 }
 
-// moveMultipleTimes moves the bot to random positions multiple times with ultra-fast mode
-func (bot *ChatBot) moveMultipleTimes(count int) error {
-        if count <= 0 {
-                return fmt.Errorf("move count must be positive")
-        }
-
-        bot.log("🎲 Starting ultra-fast multiple moves: %d times", count)
-        bot.tui.AddChatMessage("", "", fmt.Sprintf("🚀 Ultra-fast moving %d times...", count))
-
-        // Enable ultra-fast mode temporarily
-        bot.enableFastMode(true)
-        defer bot.enableFastMode(false)
-
-        successfulMoves := 0
-        var wg sync.WaitGroup
-        moveChan := make(chan Position, count)
-        errorChan := make(chan error, count)
-
-        // Pre-calculate all positions
-        go func() {
-                defer close(moveChan)
-                for i := 0; i < count; i++ {
-                        availablePositions := bot.getAvailablePositions()
-                        if len(availablePositions) == 0 {
-                                errorChan <- fmt.Errorf("no available positions for move %d", i+1)
-                                break
-                        }
-                        randomIndex := time.Now().UnixNano() % int64(len(availablePositions))
-                        moveChan <- availablePositions[randomIndex]
-                }
-        }()
-
-        // Process moves in parallel batches
-        const batchSize = 5
-        for i := 0; i < count; i += batchSize {
-                batchEnd := i + batchSize
-                if batchEnd > count {
-                        batchEnd = count
-                }
-
-                for j := i; j < batchEnd; j++ {
-                        wg.Add(1)
-                        go func(moveNum int) {
-                                defer wg.Done()
-                                
-                                select {
-                                case pos := <-moveChan:
-                                        if err := bot.moveToPositionDirect(pos.X, pos.Y); err != nil {
-                                                errorChan <- fmt.Errorf("move %d failed: %v", moveNum+1, err)
-                                                return
-                                        }
-                                        successfulMoves++
-                                        bot.log("🎲 Ultra-fast move %d/%d to (%d, %d)", moveNum+1, count, pos.X, pos.Y)
-                                case <-time.After(500 * time.Millisecond):
-                                        errorChan <- fmt.Errorf("move %d timeout", moveNum+1)
-                                        return
-                                }
-                        }(j)
-                }
-
-                wg.Wait()
-                
-                // Ultra-minimal delay between batches
-                if i+batchSize < count {
-                        time.Sleep(10 * time.Millisecond)
-                }
-        }
-
-        // Check for any errors
-        select {
-        case err := <-errorChan:
-                bot.log("⚠️ %v", err)
-        default:
-        }
-
-        bot.log("✅ Completed %d/%d ultra-fast moves", successfulMoves, count)
-        bot.tui.AddChatMessage("", "", fmt.Sprintf("🚀 Completed %d/%d ultra-fast moves", successfulMoves, count))
-        return nil
-}
-
-// pickupItemDirect sends a pickup command directly (optimized)
-func (bot *ChatBot) pickupItemDirect(itemID int) error {
+// pickupItem sends a pickup command for the specified item ID
+func (bot *ChatBot) pickupItem(itemID int) error {
         if !bot.isConnectionHealthy() {
                 return fmt.Errorf("WebSocket connection not healthy")
+        }
+
+        bot.wsMutex.Lock()
+        defer bot.wsMutex.Unlock()
+
+        if bot.wsConn == nil {
+                return fmt.Errorf("WebSocket connection not established")
         }
 
         pickupPayload := map[string]interface{}{
@@ -1310,16 +1046,9 @@ func (bot *ChatBot) pickupItemDirect(itemID int) error {
                 return fmt.Errorf("failed to marshal pickup command: %v", err)
         }
 
-        bot.wsMutex.Lock()
-        if bot.wsConn == nil {
-                bot.wsMutex.Unlock()
-                return fmt.Errorf("WebSocket connection not established")
-        }
-
-        bot.wsConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+        bot.log("📦 Picking up item ID: %d", itemID)
+        bot.wsConn.SetWriteDeadline(time.Now().Add(10 * time.Second))
         err = bot.wsConn.WriteMessage(websocket.TextMessage, msgBytes)
-        bot.wsMutex.Unlock()
-
         if err != nil {
                 bot.setConnectionStatus(false)
                 return fmt.Errorf("failed to send pickup command: %v", err)
@@ -1328,28 +1057,20 @@ func (bot *ChatBot) pickupItemDirect(itemID int) error {
         return nil
 }
 
-// pickupItem queued version for normal use
-func (bot *ChatBot) pickupItem(itemID int) error {
-        done := make(chan error, 1)
-        bot.queueAction("pickup", itemID, func(err error) {
-                done <- err
-        })
-        
-        select {
-        case err := <-done:
-                return err
-        case <-time.After(1 * time.Second):
-                return fmt.Errorf("pickup operation timeout")
-        }
-}
-
 // updateFullStatus updates the complete status bar
 func (bot *ChatBot) updateFullStatus() {
         autopickStatus := "OFF"
         if bot.isAutopickEnabled() {
                 autopickStatus = "ON"
         }
-        bot.tui.UpdateStatusBar(bot.username, bot.isConnectionHealthy(), bot.currentRoomName, bot.currentRoom, autopickStatus)
+        bot.tui.UpdateStatusBar(bot.username, bot.isConnected, bot.currentRoomName, bot.currentRoom, autopickStatus)
+}
+
+// isConnectionHealthy checks if connection is healthy
+func (bot *ChatBot) isConnectionHealthy() bool {
+        bot.connMutex.RLock()
+        defer bot.connMutex.RUnlock()
+        return bot.isConnected && bot.wsConn != nil
 }
 
 // calculateReconnectDelay returns exponential backoff delay
@@ -1582,11 +1303,20 @@ func (bot *ChatBot) connectWebSocket() error {
         return nil
 }
 
-// sendMessageDirect sends a message directly (optimized)
-func (bot *ChatBot) sendMessageDirect(message string) error {
+// sendMessageInternal sends a message over WebSocket and optionally resets the periodic timer
+func (bot *ChatBot) sendMessageInternal(message string, resetTimer bool) error {
         if !bot.isConnectionHealthy() {
                 return fmt.Errorf("WebSocket connection not healthy")
         }
+
+        bot.wsMutex.Lock()
+        defer bot.wsMutex.Unlock()
+
+        if bot.wsConn == nil {
+                return fmt.Errorf("WebSocket connection not established")
+        }
+
+        bot.log("💬 Preparing to send message to room %s: '%s'", bot.currentRoom, message)
 
         msgPayload := map[string]interface{}{
                 "type": "chat",
@@ -1598,32 +1328,20 @@ func (bot *ChatBot) sendMessageDirect(message string) error {
 
         msgBytes, err := json.Marshal(msgPayload)
         if err != nil {
+                bot.log("❌ Failed to marshal message: %v. Payload: %+v", err, msgPayload)
                 return fmt.Errorf("failed to marshal message: %v", err)
         }
 
-        bot.wsMutex.Lock()
-        if bot.wsConn == nil {
-                bot.wsMutex.Unlock()
-                return fmt.Errorf("WebSocket connection not established")
-        }
+        bot.log("📤 Sending message: %s", string(msgBytes))
 
-        bot.wsConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+        // Set a write deadline to prevent hanging
+        bot.wsConn.SetWriteDeadline(time.Now().Add(10 * time.Second))
         err = bot.wsConn.WriteMessage(websocket.TextMessage, msgBytes)
-        bot.wsMutex.Unlock()
-
         if err != nil {
+                bot.log("❌ Failed to send message: %v", err)
+                // Mark connection as unhealthy on write failure
                 bot.setConnectionStatus(false)
                 return fmt.Errorf("failed to send message: %v", err)
-        }
-
-        return nil
-}
-
-// sendMessageInternal sends a message over WebSocket and optionally resets the periodic timer
-func (bot *ChatBot) sendMessageInternal(message string, resetTimer bool) error {
-        err := bot.sendMessageDirect(message)
-        if err != nil {
-                return err
         }
 
         if resetTimer {
@@ -1719,9 +1437,9 @@ func (bot *ChatBot) sendAcknowledgment(messageType string) error {
         return nil
 }
 
-// listenForMessages reads messages from WebSocket and processes them (optimized)
+// listenForMessages reads messages from WebSocket and processes them
 func (bot *ChatBot) listenForMessages() {
-        bot.log("👂 Starting optimized message listener...")
+        bot.log("👂 Starting message listener...")
 
         for {
                 // Check if we need to reconnect
@@ -1761,113 +1479,123 @@ func (bot *ChatBot) listenForMessages() {
                 bot.wsConn.SetReadDeadline(time.Time{})
                 bot.log("📥 Raw message received: %s", string(message))
 
-                // Process message in goroutine for better performance
-                go bot.processIncomingMessage(message)
-        }
-}
-
-// processIncomingMessage processes incoming WebSocket messages asynchronously
-func (bot *ChatBot) processIncomingMessage(message []byte) {
-        var messageData map[string]interface{}
-        if errJson := json.Unmarshal(message, &messageData); errJson == nil {
-                // Handle room changes and initial room data
-                if roomInfo, ok := messageData["room"].(map[string]interface{}); ok {
-                        if idVal, idOk := roomInfo["id"]; idOk {
-                                newRoomID := fmt.Sprintf("%v", idVal)
-                                if nameVal, nameOk := roomInfo["name"].(string); nameOk {
-                                        if bot.currentRoom != newRoomID {
-                                                bot.log("🚪 Room changed by server: %s -> %s (%s)", bot.currentRoom, newRoomID, nameVal)
-                                                bot.currentRoom = newRoomID
-                                                bot.currentRoomName = nameVal
-                                                bot.tui.SetRoom(newRoomID, nameVal)
-                                                bot.updateFullStatus()
+                var messageData map[string]interface{}
+                if errJson := json.Unmarshal(message, &messageData); errJson == nil {
+                        // Handle room changes and initial room data
+                        if roomInfo, ok := messageData["room"].(map[string]interface{}); ok {
+                                if idVal, idOk := roomInfo["id"]; idOk {
+                                        newRoomID := fmt.Sprintf("%v", idVal)
+                                        if nameVal, nameOk := roomInfo["name"].(string); nameOk {
+                                                if bot.currentRoom != newRoomID {
+                                                        bot.log("🚪 Room changed by server: %s -> %s (%s)", bot.currentRoom, newRoomID, nameVal)
+                                                        bot.currentRoom = newRoomID
+                                                        bot.currentRoomName = nameVal
+                                                        bot.tui.SetRoom(newRoomID, nameVal)
+                                                        bot.updateFullStatus()
+                                                }
                                         }
                                 }
-                        }
 
-                        // Parse room fields for movement
-                        if fields, fieldsOk := roomInfo["fields"].([]interface{}); fieldsOk {
-                                bot.parseRoomFields(fields)
-                        }
+                                // Parse room fields for movement
+                                if fields, fieldsOk := roomInfo["fields"].([]interface{}); fieldsOk {
+                                        bot.parseRoomFields(fields)
+                                }
 
-                        // Parse initial client list when joining room
-                        if clientsData, clientsOk := messageData["clients"].(map[string]interface{}); clientsOk {
-                                if updates, updatesOk := clientsData["updates"].([]interface{}); updatesOk {
-                                        var users []string
-                                        for _, update := range updates {
-                                                if client, clientOk := update.(map[string]interface{}); clientOk {
-                                                        if username, usernameOk := client["username"].(string); usernameOk {
-                                                                users = append(users, username)
+                                // Parse initial client list when joining room
+                                if clientsData, clientsOk := messageData["clients"].(map[string]interface{}); clientsOk {
+                                        if updates, updatesOk := clientsData["updates"].([]interface{}); updatesOk {
+                                                var users []string
+                                                for _, update := range updates {
+                                                        if client, clientOk := update.(map[string]interface{}); clientOk {
+                                                                var clientID int
+                                                                var username string
 
-                                                                // Track initial positions
-                                                                if x, xOk := client["x"].(float64); xOk {
-                                                                        if y, yOk := client["y"].(float64); yOk {
-                                                                                bot.updateUserPosition(username, int(x), int(y))
-                                                                        }
+                                                                if id, idOk := client["id"].(float64); idOk {
+                                                                        clientID = int(id)
                                                                 }
+                                                                if name, nameOk := client["username"].(string); nameOk {
+                                                                        username = name
+                                                                        users = append(users, username)
+                                                                        
+                                                                        // Store client ID mapping
+                                                                        if clientID != 0 {
+                                                                                bot.setClientUsername(clientID, username)
+                                                                        }
 
-                                                                // Track our own position
-                                                                if isPlayer, playerOk := client["isPlayer"].(bool); playerOk && isPlayer {
+                                                                        // Track initial positions
                                                                         if x, xOk := client["x"].(float64); xOk {
                                                                                 if y, yOk := client["y"].(float64); yOk {
-                                                                                        bot.updateUserPosition(bot.username, int(x), int(y))
+                                                                                        bot.updateClientPosition(clientID, int(x), int(y))
                                                                                 }
                                                                         }
                                                                 }
                                                         }
                                                 }
+                                                bot.tui.SetRoomUsers(users)
+                                                bot.log("👥 Found %d users in room", len(users))
                                         }
-                                        bot.tui.SetRoomUsers(users)
-                                        bot.log("👥 Found %d users in room", len(users))
                                 }
                         }
-                }
 
-                // Handle client updates (user joins and position updates)
-                if clientsData, ok := messageData["clients"].(map[string]interface{}); ok {
-                        // Handle user joins (updates)
-                        if updates, updatesOk := clientsData["updates"].([]interface{}); updatesOk {
-                                for _, update := range updates {
-                                        if client, clientOk := update.(map[string]interface{}); clientOk {
-                                                // Extract user info
-                                                var username string
-                                                var userX, userY int
+                        // Handle client updates (user joins and position updates)
+                        if clientsData, ok := messageData["clients"].(map[string]interface{}); ok {
+                                // Handle user updates
+                                if updates, updatesOk := clientsData["updates"].([]interface{}); updatesOk {
+                                        for _, update := range updates {
+                                                if client, clientOk := update.(map[string]interface{}); clientOk {
+                                                        var clientID int
+                                                        var username string
+                                                        var userX, userY int
+                                                        hasPosition := false
 
-                                                if name, nameOk := client["username"].(string); nameOk {
-                                                        username = name
-                                                }
-                                                if x, xOk := client["x"].(float64); xOk {
-                                                        userX = int(x)
-                                                }
-                                                if y, yOk := client["y"].(float64); yOk {
-                                                        userY = int(y)
-                                                }
-
-                                                // Update user position if we have coordinates
-                                                if username != "" && (userX != 0 || userY != 0) {
-                                                        bot.updateUserPosition(username, userX, userY)
-                                                }
-
-                                                // Check for new user join (not initial room data)
-                                                if username != "" {
-                                                        if _, hasRoom := messageData["room"]; !hasRoom {
-                                                                bot.tui.AddUser(username)
-                                                                bot.log("👤 User joined: %s", username)
+                                                        // Extract client ID
+                                                        if id, idOk := client["id"].(float64); idOk {
+                                                                clientID = int(id)
                                                         }
-                                                }
 
-                                                // Handle chat messages from events within client updates
-                                                if events, eventsOk := client["events"].([]interface{}); eventsOk {
-                                                        for _, event := range events {
-                                                                if eventData, eventOk := event.(map[string]interface{}); eventOk {
-                                                                        if eventType, typeOk := eventData["type"].(string); typeOk && eventType == "chat" {
-                                                                                if data, dataOk := eventData["data"].(map[string]interface{}); dataOk {
-                                                                                        if username, usernameOk := data["username"].(string); usernameOk {
-                                                                                                if message, messageOk := data["message"].(string); messageOk {
-                                                                                                        bot.log("💬 Chat [%s]: %s", username, message)
-                                                                                                        // Don't display your own messages again (they're already shown when sent)
-                                                                                                        if username != bot.username {
-                                                                                                                bot.tui.AddChatMessage("", username, message)
+                                                        // Extract username if present
+                                                        if name, nameOk := client["username"].(string); nameOk {
+                                                                username = name
+                                                                // Store the client ID to username mapping
+                                                                if clientID != 0 {
+                                                                        bot.setClientUsername(clientID, username)
+                                                                }
+                                                        }
+
+                                                        // Extract position if present
+                                                        if x, xOk := client["x"].(float64); xOk {
+                                                                userX = int(x)
+                                                                hasPosition = true
+                                                                if y, yOk := client["y"].(float64); yOk {
+                                                                        userY = int(y)
+                                                                }
+                                                        }
+
+                                                        // Update position tracking by client ID
+                                                        if clientID != 0 && hasPosition {
+                                                                bot.updateClientPosition(clientID, userX, userY)
+                                                        }
+
+                                                        // Handle new user joins (when we have username but no room data)
+                                                        if username != "" && clientID != 0 {
+                                                                if _, hasRoom := messageData["room"]; !hasRoom {
+                                                                        bot.tui.AddUser(username)
+                                                                        bot.log("👤 User joined: %s (ClientID:%d)", username, clientID)
+                                                                }
+                                                        }
+
+                                                        // Handle chat messages
+                                                        if events, eventsOk := client["events"].([]interface{}); eventsOk {
+                                                                for _, event := range events {
+                                                                        if eventData, eventOk := event.(map[string]interface{}); eventOk {
+                                                                                if eventType, typeOk := eventData["type"].(string); typeOk && eventType == "chat" {
+                                                                                        if data, dataOk := eventData["data"].(map[string]interface{}); dataOk {
+                                                                                                if chatUsername, usernameOk := data["username"].(string); usernameOk {
+                                                                                                        if message, messageOk := data["message"].(string); messageOk {
+                                                                                                                bot.log("💬 Chat [%s]: %s", chatUsername, message)
+                                                                                                                if chatUsername != bot.username {
+                                                                                                                        bot.tui.AddChatMessage("", chatUsername, message)
+                                                                                                                }
                                                                                                         }
                                                                                                 }
                                                                                         }
@@ -1875,33 +1603,33 @@ func (bot *ChatBot) processIncomingMessage(message []byte) {
                                                                         }
                                                                 }
                                                         }
-                                                }
 
-                                                // Handle item removal from user (item being dropped)
-                                                if items, itemsOk := client["items"].(map[string]interface{}); itemsOk {
-                                                        if removes, removesOk := items["removes"].([]interface{}); removesOk {
-                                                                for _, removeItem := range removes {
-                                                                        if itemID, itemIDOk := removeItem.(float64); itemIDOk {
-                                                                                // Check if there's a corresponding item update (item being dropped)
-                                                                                if itemsUpdates, hasItemsUpdates := messageData["items"].(map[string]interface{}); hasItemsUpdates {
-                                                                                        if updatesArray, updatesOk := itemsUpdates["updates"].([]interface{}); updatesOk {
-                                                                                                for _, itemUpdate := range updatesArray {
-                                                                                                        if item, itemOk := itemUpdate.(map[string]interface{}); itemOk {
-                                                                                                                if id, idOk := item["id"].(float64); idOk && int(id) == int(itemID) {
-                                                                                                                        // This is an item being dropped
-                                                                                                                        itemName := "Unknown Item"
-                                                                                                                        if name, nameOk := item["name"].(string); nameOk {
-                                                                                                                                itemName = name
-                                                                                                                        }
-                                                                                                                        itemX, itemY := 0, 0
-                                                                                                                        if x, xOk := item["x"].(float64); xOk {
-                                                                                                                                itemX = int(x)
-                                                                                                                        }
-                                                                                                                        if y, yOk := item["y"].(float64); yOk {
-                                                                                                                                itemY = int(y)
-                                                                                                                        }
+                                                        // Handle item removal (items being dropped) - now using client ID
+                                                        if items, itemsOk := client["items"].(map[string]interface{}); itemsOk {
+                                                                if removes, removesOk := items["removes"].([]interface{}); removesOk {
+                                                                        for _, removeItem := range removes {
+                                                                                if itemID, itemIDOk := removeItem.(float64); itemIDOk {
+                                                                                        // Check if there's a corresponding item update (item being dropped)
+                                                                                        if itemsUpdates, hasItemsUpdates := messageData["items"].(map[string]interface{}); hasItemsUpdates {
+                                                                                                if updatesArray, updatesOk := itemsUpdates["updates"].([]interface{}); updatesOk {
+                                                                                                        for _, itemUpdate := range updatesArray {
+                                                                                                                if item, itemOk := itemUpdate.(map[string]interface{}); itemOk {
+                                                                                                                        if id, idOk := item["id"].(float64); idOk && int(id) == int(itemID) {
+                                                                                                                                // This is an item being dropped
+                                                                                                                                itemName := "Unknown Item"
+                                                                                                                                if name, nameOk := item["name"].(string); nameOk {
+                                                                                                                                        itemName = name
+                                                                                                                                }
+                                                                                                                                itemX, itemY := 0, 0
+                                                                                                                                if x, xOk := item["x"].(float64); xOk {
+                                                                                                                                        itemX = int(x)
+                                                                                                                                }
+                                                                                                                                if y, yOk := item["y"].(float64); yOk {
+                                                                                                                                        itemY = int(y)
+                                                                                                                                }
 
-                                                                                                                        bot.handleItemDropped(int(itemID), itemName, itemX, itemY, username)
+                                                                                                                                bot.handleItemDropped(int(itemID), itemName, itemX, itemY, clientID)
+                                                                                                                        }
                                                                                                                 }
                                                                                                         }
                                                                                                 }
@@ -1913,31 +1641,34 @@ func (bot *ChatBot) processIncomingMessage(message []byte) {
                                                 }
                                         }
                                 }
-                        }
 
-                        // Handle user leaves/disconnects (removes)
-                        if _, removesOk := clientsData["removes"].([]interface{}); removesOk {
-                                // We need to track user IDs to usernames to handle removes properly
-                                // For now, we'll parse the system message to get the username
-                                if player, playerOk := messageData["player"].(map[string]interface{}); playerOk {
-                                        if events, eventsOk := player["events"].([]interface{}); eventsOk {
-                                                for _, event := range events {
-                                                        if eventData, eventOk := event.(map[string]interface{}); eventOk {
-                                                                if eventType, typeOk := eventData["type"].(string); typeOk && eventType == "system" {
-                                                                        if data, dataOk := eventData["data"].(map[string]interface{}); dataOk {
-                                                                                if message, msgOk := data["message"].(string); msgOk {
-                                                                                        // Parse system messages like "XXX gik til Receptionen" or "XXX mistede forbindelsen"
-                                                                                        if strings.Contains(message, "gik til") || strings.Contains(message, "mistede forbindelsen") {
-                                                                                                parts := strings.Fields(message)
-                                                                                                if len(parts) > 0 {
-                                                                                                        username := parts[0]
-                                                                                                        bot.tui.RemoveUser(username)
-                                                                                                        bot.tui.AddChatMessage("", "", message)
-                                                                                                        bot.log("👤 User left/disconnected: %s", username)
-
-                                                                                                        // Remove from position tracking
-                                                                                                        bot.userPositions.Delete(username)
-                                                                                                        atomic.StoreInt32(&bot.cacheValid, 0) // Invalidate cache
+                                // Handle user leaves/disconnects (removes)
+                                if removes, removesOk := clientsData["removes"].([]interface{}); removesOk {
+                                        for _, removeData := range removes {
+                                                if clientID, clientIDOk := removeData.(float64); clientIDOk {
+                                                        // Remove from client mapping
+                                                        bot.removeClient(int(clientID))
+                                                }
+                                        }
+                                        
+                                        // We need to track user IDs to usernames to handle removes properly
+                                        // For now, we'll parse the system message to get the username
+                                        if player, playerOk := messageData["player"].(map[string]interface{}); playerOk {
+                                                if events, eventsOk := player["events"].([]interface{}); eventsOk {
+                                                        for _, event := range events {
+                                                                if eventData, eventOk := event.(map[string]interface{}); eventOk {
+                                                                        if eventType, typeOk := eventData["type"].(string); typeOk && eventType == "system" {
+                                                                                if data, dataOk := eventData["data"].(map[string]interface{}); dataOk {
+                                                                                        if message, msgOk := data["message"].(string); msgOk {
+                                                                                                // Parse system messages like "XXX gik til Receptionen" or "XXX mistede forbindelsen"
+                                                                                                if strings.Contains(message, "gik til") || strings.Contains(message, "mistede forbindelsen") {
+                                                                                                        parts := strings.Fields(message)
+                                                                                                        if len(parts) > 0 {
+                                                                                                                username := parts[0]
+                                                                                                                bot.tui.RemoveUser(username)
+                                                                                                                bot.tui.AddChatMessage("", "", message)
+                                                                                                                bot.log("👤 User left/disconnected: %s", username)
+                                                                                                        }
                                                                                                 }
                                                                                         }
                                                                                 }
@@ -1948,66 +1679,66 @@ func (bot *ChatBot) processIncomingMessage(message []byte) {
                                         }
                                 }
                         }
-                }
 
-                // Handle item pickups (items being removed from the game)
-                if itemsData, ok := messageData["items"].(map[string]interface{}); ok {
-                        if removes, removesOk := itemsData["removes"].([]interface{}); removesOk {
-                                for _, removeItem := range removes {
-                                        if itemID, itemIDOk := removeItem.(float64); itemIDOk {
-                                                // This is an item being picked up by someone
-                                                bot.handleItemPickedUp(int(itemID))
-                                        }
-                                }
-                        }
-                }
-
-                // Handle system events
-                if player, hasPlayer := messageData["player"].(map[string]interface{}); hasPlayer {
-                        // Handle onlineTime updates
-                        if onlineTime, hasOnlineTime := player["onlineTime"].(map[string]interface{}); hasOnlineTime {
-                                if hours, hasHours := onlineTime["hours"]; hasHours {
-                                        if minutes, hasMinutes := onlineTime["minutes"]; hasMinutes {
-                                                if h, hOk := hours.(float64); hOk {
-                                                        if m, mOk := minutes.(float64); mOk {
-                                                                bot.tui.UpdateOnlineTime(int(h), int(m))
-                                                                bot.updateFullStatus()
-                                                                bot.log("⏰ Online time updated: %dh %dm", int(h), int(m))
-                                                        }
+                        // Handle item pickups (items being removed from the game)
+                        if itemsData, ok := messageData["items"].(map[string]interface{}); ok {
+                                if removes, removesOk := itemsData["removes"].([]interface{}); removesOk {
+                                        for _, removeItem := range removes {
+                                                if itemID, itemIDOk := removeItem.(float64); itemIDOk {
+                                                        // This is an item being picked up by someone
+                                                        bot.handleItemPickedUp(int(itemID))
                                                 }
                                         }
                                 }
                         }
 
-                        // Handle newHour events
-                        if newHour, hasNewHour := player["newHour"].(bool); hasNewHour && newHour {
-                                bot.log("🕐 'newHour' event detected from server - sending acknowledgment...")
-                                go func() {
-                                        if errAck := bot.sendAcknowledgment("newHour"); errAck != nil {
-                                                bot.log("❌ Failed to acknowledge 'newHour' event: %v", errAck)
+                        // Handle system events
+                        if player, hasPlayer := messageData["player"].(map[string]interface{}); hasPlayer {
+                                // Handle onlineTime updates
+                                if onlineTime, hasOnlineTime := player["onlineTime"].(map[string]interface{}); hasOnlineTime {
+                                        if hours, hasHours := onlineTime["hours"]; hasHours {
+                                                if minutes, hasMinutes := onlineTime["minutes"]; hasMinutes {
+                                                        if h, hOk := hours.(float64); hOk {
+                                                                if m, mOk := minutes.(float64); mOk {
+                                                                        bot.tui.UpdateOnlineTime(int(h), int(m))
+                                                                        bot.updateFullStatus()
+                                                                        bot.log("⏰ Online time updated: %dh %dm", int(h), int(m))
+                                                                }
+                                                        }
+                                                }
                                         }
-                                }()
-                        }
+                                }
 
-                        // Handle system events like user arrivals
-                        if events, eventsOk := player["events"].([]interface{}); eventsOk {
-                                for _, event := range events {
-                                        if eventData, eventOk := event.(map[string]interface{}); eventOk {
-                                                if eventType, typeOk := eventData["type"].(string); typeOk && eventType == "system" {
-                                                        if data, dataOk := eventData["data"].(map[string]interface{}); dataOk {
-                                                                if message, msgOk := data["message"].(string); msgOk {
-                                                                        // Handle user arrival messages
-                                                                        if strings.Contains(message, "ankom til rummet") {
-                                                                                parts := strings.Fields(message)
-                                                                                if len(parts) > 0 {
-                                                                                        username := parts[0]
-                                                                                        bot.tui.AddUser(username)
+                                // Handle newHour events
+                                if newHour, hasNewHour := player["newHour"].(bool); hasNewHour && newHour {
+                                        bot.log("🕐 'newHour' event detected from server - sending acknowledgment...")
+                                        go func() {
+                                                if errAck := bot.sendAcknowledgment("newHour"); errAck != nil {
+                                                        bot.log("❌ Failed to acknowledge 'newHour' event: %v", errAck)
+                                                }
+                                        }()
+                                }
+
+                                // Handle system events like user arrivals
+                                if events, eventsOk := player["events"].([]interface{}); eventsOk {
+                                        for _, event := range events {
+                                                if eventData, eventOk := event.(map[string]interface{}); eventOk {
+                                                        if eventType, typeOk := eventData["type"].(string); typeOk && eventType == "system" {
+                                                                if data, dataOk := eventData["data"].(map[string]interface{}); dataOk {
+                                                                        if message, msgOk := data["message"].(string); msgOk {
+                                                                                // Handle user arrival messages
+                                                                                if strings.Contains(message, "ankom til rummet") {
+                                                                                        parts := strings.Fields(message)
+                                                                                        if len(parts) > 0 {
+                                                                                                username := parts[0]
+                                                                                                bot.tui.AddUser(username)
+                                                                                                bot.tui.AddChatMessage("", "", message)
+                                                                                                bot.log("👤 User arrived: %s", username)
+                                                                                        }
+                                                                                } else if strings.Contains(message, "Du er ankommet til") {
+                                                                                        // Handle own arrival message
                                                                                         bot.tui.AddChatMessage("", "", message)
-                                                                                        bot.log("👤 User arrived: %s", username)
                                                                                 }
-                                                                        } else if strings.Contains(message, "Du er ankommet til") {
-                                                                                // Handle own arrival message
-                                                                                bot.tui.AddChatMessage("", "", message)
                                                                         }
                                                                 }
                                                         }
@@ -2015,33 +1746,33 @@ func (bot *ChatBot) processIncomingMessage(message []byte) {
                                         }
                                 }
                         }
-                }
 
-                // Handle chat messages - display in chat pane (legacy format, keeping for compatibility)
-                if msgType, ok := messageData["type"].(string); ok && (msgType == "chat" || msgType == "message") {
-                        if data, dataOk := messageData["data"].(map[string]interface{}); dataOk {
-                                username, _ := data["username"].(string)
-                                chatMsg, _ := data["message"].(string)
-                                if username != "" && chatMsg != "" {
-                                        bot.log("💬 Chat [%s]: %s", username, chatMsg)
-                                        // Don't display your own messages again (they're already shown when sent)
-                                        if username != bot.username {
-                                                bot.tui.AddChatMessage("", username, chatMsg)
+                        // Handle chat messages - display in chat pane (legacy format, keeping for compatibility)
+                        if msgType, ok := messageData["type"].(string); ok && (msgType == "chat" || msgType == "message") {
+                                if data, dataOk := messageData["data"].(map[string]interface{}); dataOk {
+                                        username, _ := data["username"].(string)
+                                        chatMsg, _ := data["message"].(string)
+                                        if username != "" && chatMsg != "" {
+                                                bot.log("💬 Chat [%s]: %s", username, chatMsg)
+                                                // Don't display your own messages again (they're already shown when sent)
+                                                if username != bot.username {
+                                                        bot.tui.AddChatMessage("", username, chatMsg)
+                                                }
                                         }
                                 }
                         }
-                }
-                if user, userOk := messageData["user"].(string); userOk {
-                        if text, textOk := messageData["text"].(string); textOk {
-                                bot.log("💬 Chat [%s]: %s", user, text)
-                                // Don't display your own messages again (they're already shown when sent)
-                                if user != bot.username {
-                                        bot.tui.AddChatMessage("", user, text)
+                        if user, userOk := messageData["user"].(string); userOk {
+                                if text, textOk := messageData["text"].(string); textOk {
+                                        bot.log("💬 Chat [%s]: %s", user, text)
+                                        // Don't display your own messages again (they're already shown when sent)
+                                        if user != bot.username {
+                                                bot.tui.AddChatMessage("", user, text)
+                                        }
                                 }
                         }
+                } else {
+                        bot.log("⚠️ Could not parse message as JSON: %v. Message: %s", errJson, string(message))
                 }
-        } else {
-                bot.log("⚠️ Could not parse message as JSON: %v. Message: %s", errJson, string(message))
         }
 }
 
@@ -2093,35 +1824,14 @@ func (bot *ChatBot) sendPeriodicMessages() {
         }
 }
 
-// setupInputHandler configures the input field for commands and messages (optimized)
+// setupInputHandler configures the input field for commands and messages
 func (bot *ChatBot) setupInputHandler() {
-        // Set up input capture for arrow keys (for command history)
-        bot.tui.inputField.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-                switch event.Key() {
-                case tcell.KeyUp:
-                        // Get previous command from history
-                        if historyItem := bot.tui.GetHistoryUp(); historyItem != "" {
-                                bot.tui.inputField.SetText(historyItem)
-                        }
-                        return nil // Consume the event
-                case tcell.KeyDown:
-                        // Get next command from history
-                        historyItem := bot.tui.GetHistoryDown()
-                        bot.tui.inputField.SetText(historyItem)
-                        return nil // Consume the event
-                }
-                return event // Pass through other events
-        })
-
         bot.tui.inputField.SetDoneFunc(func(key tcell.Key) {
                 if key == tcell.KeyEnter {
                         input := strings.TrimSpace(bot.tui.inputField.GetText())
                         if input == "" {
                                 return
                         }
-
-                        // Add to input history
-                        bot.tui.AddToInputHistory(input)
 
                         // Clear input field immediately for better UX
                         bot.tui.inputField.SetText("")
@@ -2130,8 +1840,7 @@ func (bot *ChatBot) setupInputHandler() {
                         go func(message string) {
                                 // Handle commands
                                 if strings.HasPrefix(message, "/") {
-                                        fields := strings.Fields(message)
-                                        command := fields[0]
+                                        command := strings.Fields(message)[0]
 
                                         switch command {
                                         case "/quit", "/exit", "/q":
@@ -2148,8 +1857,7 @@ func (bot *ChatBot) setupInputHandler() {
                                                 bot.tui.AddChatMessage("", "", "/clear - Clear chat history")
                                                 bot.tui.AddChatMessage("", "", "/logs - Show log file information")
                                                 bot.tui.AddChatMessage("", "", "/autopick - Toggle autopick on/off")
-                                                bot.tui.AddChatMessage("", "", "/move [count] - Move to random field (optionally multiple times ultra-fast)")
-                                                bot.tui.AddChatMessage("", "", "/fast - Toggle ultra-fast mode on/off")
+                                                bot.tui.AddChatMessage("", "", "/move - Move to random open field")
                                         case "/status":
                                                 wsStatus := "Disconnected"
                                                 if bot.isConnectionHealthy() {
@@ -2159,10 +1867,6 @@ func (bot *ChatBot) setupInputHandler() {
                                                 if bot.isAutopickEnabled() {
                                                         autopickStatus = "ENABLED"
                                                 }
-                                                fastModeStatus := "NORMAL"
-                                                if atomic.LoadInt32(&bot.fastMode) == 1 {
-                                                        fastModeStatus = "ULTRA-FAST"
-                                                }
                                                 hours, minutes := bot.tui.GetOnlineTime()
                                                 bot.tui.AddChatMessage("", "", fmt.Sprintf("Username: %s", bot.username))
                                                 bot.tui.AddChatMessage("", "", fmt.Sprintf("Current Room: %s (%s)", bot.currentRoomName, bot.currentRoom))
@@ -2170,7 +1874,6 @@ func (bot *ChatBot) setupInputHandler() {
                                                 bot.tui.AddChatMessage("", "", fmt.Sprintf("Online Time: %dh %dm", hours, minutes))
                                                 bot.tui.AddChatMessage("", "", fmt.Sprintf("Message Interval: %v", bot.messageInterval))
                                                 bot.tui.AddChatMessage("", "", fmt.Sprintf("Autopick: %s", autopickStatus))
-                                                bot.tui.AddChatMessage("", "", fmt.Sprintf("Performance Mode: %s", fastModeStatus))
                                                 bot.tui.AddChatMessage("", "", fmt.Sprintf("Reconnect Count: %d", bot.reconnectCount))
                                                 if !bot.lastReconnect.IsZero() {
                                                         bot.tui.AddChatMessage("", "", fmt.Sprintf("Last Reconnect: %s", bot.lastReconnect.Format("15:04:05")))
@@ -2178,12 +1881,12 @@ func (bot *ChatBot) setupInputHandler() {
 
                                                 // Show tracked items if autopick is enabled
                                                 if bot.isAutopickEnabled() {
-                                                        itemCount := 0
-                                                        bot.droppedItems.Range(func(key, value interface{}) bool {
-                                                                itemCount++
-                                                                return true
-                                                        })
+                                                        bot.positionMutex.RLock()
+                                                        itemCount := len(bot.droppedItems)
+                                                        userCount := len(bot.clientPositions)
+                                                        bot.positionMutex.RUnlock()
                                                         bot.tui.AddChatMessage("", "", fmt.Sprintf("Tracked Items: %d", itemCount))
+                                                        bot.tui.AddChatMessage("", "", fmt.Sprintf("Tracked Clients: %d", userCount))
                                                 }
                                         case "/reconnect":
                                                 bot.tui.AddChatMessage("", "", "*** Forcing reconnection... ***")
@@ -2199,34 +1902,14 @@ func (bot *ChatBot) setupInputHandler() {
                                                         }
                                                 }()
                                         case "/move":
-                                                // Check if a count was provided
-                                                if len(fields) > 1 {
-                                                        // Parse the count
-                                                        if count, err := strconv.Atoi(fields[1]); err != nil {
-                                                                bot.tui.AddChatMessage("", "", fmt.Sprintf("❌ Invalid move count: '%s'. Must be a positive number.", fields[1]))
-                                                        } else if count <= 0 {
-                                                                bot.tui.AddChatMessage("", "", "❌ Move count must be positive")
-                                                        } else if count > 500 {
-                                                                bot.tui.AddChatMessage("", "", "❌ Move count too high (max 500 for ultra-fast mode)")
-                                                        } else {
-                                                                // Perform multiple moves ultra-fast
-                                                                go func() {
-                                                                        if err := bot.moveMultipleTimes(count); err != nil {
-                                                                                bot.tui.AddChatMessage("", "", fmt.Sprintf("❌ Multiple move failed: %v", err))
-                                                                        }
-                                                                }()
-                                                        }
+                                                availablePositions := bot.getAvailablePositions()
+                                                if len(availablePositions) == 0 {
+                                                        bot.tui.AddChatMessage("", "", "❌ No available positions to move to")
                                                 } else {
-                                                        // Single move (original behavior)
-                                                        availablePositions := bot.getAvailablePositions()
-                                                        if len(availablePositions) == 0 {
-                                                                bot.tui.AddChatMessage("", "", "❌ No available positions to move to")
+                                                        if err := bot.moveToRandomPosition(); err != nil {
+                                                                bot.tui.AddChatMessage("", "", fmt.Sprintf("❌ Failed to move: %v", err))
                                                         } else {
-                                                                if err := bot.moveToRandomPosition(); err != nil {
-                                                                        bot.tui.AddChatMessage("", "", fmt.Sprintf("❌ Failed to move: %v", err))
-                                                                } else {
-                                                                        bot.tui.AddChatMessage("", "", fmt.Sprintf("🎲 Moving to random position (%d available)", len(availablePositions)))
-                                                                }
+                                                                bot.tui.AddChatMessage("", "", fmt.Sprintf("🎲 Moving to random position (%d available)", len(availablePositions)))
                                                         }
                                                 }
                                         case "/autopick":
@@ -2237,14 +1920,6 @@ func (bot *ChatBot) setupInputHandler() {
                                                         newStatus = "DISABLED"
                                                 }
                                                 bot.tui.AddChatMessage("", "", fmt.Sprintf("🤖 Autopick %s", newStatus))
-                                        case "/fast":
-                                                currentMode := atomic.LoadInt32(&bot.fastMode) == 1
-                                                bot.enableFastMode(!currentMode)
-                                                newMode := "NORMAL"
-                                                if atomic.LoadInt32(&bot.fastMode) == 1 {
-                                                        newMode = "ULTRA-FAST"
-                                                }
-                                                bot.tui.AddChatMessage("", "", fmt.Sprintf("🚀 Performance mode: %s", newMode))
                                         case "/logs":
                                                 currentDate := time.Now().Format("2006-01-02")
                                                 chatLogPath := fmt.Sprintf("logs/%s_chat_log.txt", currentDate)
@@ -2281,37 +1956,33 @@ func (bot *ChatBot) setupInputHandler() {
         bot.tui.app.SetFocus(bot.tui.inputField)
 }
 
-// sendKeepAlive sends WebSocket ping messages periodically (optimized)
+// sendKeepAlive sends WebSocket ping messages periodically
 func (bot *ChatBot) sendKeepAlive() {
-        bot.log("💓 Starting optimized keep-alive sender (30 second interval)")
+        bot.log("💓 Starting keep-alive sender (30 second interval)")
         ticker := time.NewTicker(30 * time.Second)
         defer ticker.Stop()
 
         for range ticker.C {
                 if bot.isConnectionHealthy() {
-                        bot.wsMutex.RLock()
-                        if bot.wsConn != nil {
-                                bot.wsConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-                                if err := bot.wsConn.WriteMessage(websocket.PingMessage, []byte("keepalive")); err != nil {
-                                        bot.wsMutex.RUnlock()
-                                        bot.log("❌ Failed to send ping: %v", err)
-                                        bot.setConnectionStatus(false)
-                                } else {
-                                        bot.wsMutex.RUnlock()
-                                        bot.log("💓 Keep-alive ping sent successfully")
-                                }
+                        bot.wsMutex.Lock()
+                        bot.wsConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+                        if err := bot.wsConn.WriteMessage(websocket.PingMessage, []byte("keepalive")); err != nil {
+                                bot.log("❌ Failed to send ping: %v", err)
+                                // Mark connection as unhealthy on ping failure
+                                bot.setConnectionStatus(false)
                         } else {
-                                bot.wsMutex.RUnlock()
+                                bot.log("💓 Keep-alive ping sent successfully")
                         }
+                        bot.wsMutex.Unlock()
                 } else {
                         bot.log("⚠️ Skipping keep-alive ping - connection not healthy")
                 }
         }
 }
 
-// startStatusUpdater keeps the status bar current time updated (optimized)
+// startStatusUpdater keeps the status bar current time updated
 func (bot *ChatBot) startStatusUpdater() {
-        bot.log("⏰ Starting optimized status updater (5 second interval)")
+        bot.log("⏰ Starting status updater (5 second interval)")
         ticker := time.NewTicker(5 * time.Second)
         defer ticker.Stop()
 
@@ -2321,9 +1992,9 @@ func (bot *ChatBot) startStatusUpdater() {
         }
 }
 
-// Start initializes and runs the bot (optimized)
+// Start initializes and runs the bot
 func (bot *ChatBot) Start() error {
-        bot.log("🚀 Starting ultra-optimized Skyskraber chat bot...")
+        bot.log("🚀 Starting Skyskraber chat bot...")
         bot.tui.UpdateStatusBar(bot.username, false, "", "Starting...", "OFF")
 
         bot.log("🔐 Step 1: Authenticating...")
@@ -2342,41 +2013,38 @@ func (bot *ChatBot) Start() error {
         bot.setConnectionStatus(true)
         bot.lastReconnect = time.Now()
 
-        bot.log("👂 Step 3: Starting optimized message listener...")
+        bot.log("👂 Step 3: Starting message listener...")
         go bot.listenForMessages()
 
         bot.log("🕐 Step 4: Starting periodic message sender...")
         go bot.sendPeriodicMessages()
 
-        bot.log("💓 Step 5: Starting optimized keep-alive routine...")
+        bot.log("💓 Step 5: Starting keep-alive routine...")
         go bot.sendKeepAlive()
 
-        bot.log("⏰ Step 6: Starting optimized status updater...")
+        bot.log("⏰ Step 6: Starting status updater...")
         go bot.startStatusUpdater()
 
-        bot.log("⌨️ Step 7: Setting up optimized input handler...")
+        bot.log("⌨️ Step 7: Setting up input handler...")
         bot.setupInputHandler()
 
-        bot.log("✅ Ultra-optimized bot started successfully! 🚀")
+        bot.log("✅ Bot started successfully! 🎉")
         bot.updateFullStatus()
 
-        bot.tui.AddChatMessage("", "", "=== Ultra-Optimized Skyskraber Chat Bot Started ===")
+        bot.tui.AddChatMessage("", "", "=== Skyskraber Chat Bot Started ===")
         bot.tui.AddChatMessage("", "", "Type /help for available commands")
         bot.tui.AddChatMessage("", "", "Press Ctrl+C or type /quit to exit")
         bot.tui.AddChatMessage("", "", "📁 Logs are being saved to logs/ directory")
         bot.tui.AddChatMessage("", "", "🤖 Autopick is DISABLED by default - use /autopick to enable")
         bot.tui.AddChatMessage("", "", "🎲 Use /move to move to random open field")
-        bot.tui.AddChatMessage("", "", "🚀 Use /move <number> to move multiple times ultra-fast (max 500)")
-        bot.tui.AddChatMessage("", "", "🚀 Use /fast to toggle ultra-fast performance mode")
         bot.tui.AddChatMessage("", "", "⬆️⬇️ Use arrow keys to navigate input history")
-        bot.tui.AddChatMessage("", "", "🚀 All operations are now ultra-optimized for maximum performance!")
 
         return nil
 }
 
-// Stop gracefully shuts down the bot (optimized)
+// Stop gracefully shuts down the bot
 func (bot *ChatBot) Stop() {
-        bot.log("🛑 Stopping ultra-optimized bot...")
+        bot.log("🛑 Stopping bot...")
 
         bot.timerMutex.Lock()
         if bot.messageTimer != nil {
@@ -2396,13 +2064,9 @@ func (bot *ChatBot) Stop() {
                 bot.log("🔌 WebSocket connection closed.")
         }
 
-        // Close performance queues
-        close(bot.moveQueue)
-        close(bot.actionQueue)
-
         bot.log("📁 Closing log files...")
         bot.tui.closeLogFiles()
-        bot.log("✅ Ultra-optimized bot stopped.")
+        bot.log("✅ Bot stopped.")
 }
 
 // main is the entry point of the application
