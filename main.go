@@ -42,6 +42,9 @@ type TUI struct {
 	userMutex    sync.Mutex
 	users        map[string]bool
 	currentRoom  string
+	onlineHours  int
+	onlineMinutes int
+	onlineTimeMutex sync.RWMutex
 }
 
 // ChatBot represents the chat bot instance
@@ -58,6 +61,7 @@ type ChatBot struct {
 	currentMsgIndex int
 	wsMutex         sync.Mutex
 	currentRoom     string
+	currentRoomName string
 	messageTimer    *time.Timer
 	timerMutex      sync.Mutex
 	tui             *TUI
@@ -234,12 +238,48 @@ func (tui *TUI) SetRoomUsers(usernames []string) {
 	tui.UpdateUsers(usernames)
 }
 
-// UpdateStatus updates the status bar
-func (tui *TUI) UpdateStatus(status string) {
+// UpdateOnlineTime updates the tracked online time from server data
+func (tui *TUI) UpdateOnlineTime(hours, minutes int) {
+	tui.onlineTimeMutex.Lock()
+	tui.onlineHours = hours
+	tui.onlineMinutes = minutes
+	tui.onlineTimeMutex.Unlock()
+}
+
+// GetOnlineTime returns the current online time
+func (tui *TUI) GetOnlineTime() (int, int) {
+	tui.onlineTimeMutex.RLock()
+	defer tui.onlineTimeMutex.RUnlock()
+	return tui.onlineHours, tui.onlineMinutes
+}
+
+// UpdateStatusBar updates the comprehensive status bar with all information
+func (tui *TUI) UpdateStatusBar(username string, connected bool, roomName, roomID string) {
 	tui.app.QueueUpdateDraw(func() {
+		currentTime := time.Now().Format("15:04:05")
+		
+		var connStatus string
+		if connected {
+			connStatus = fmt.Sprintf("Connected as %s", username)
+		} else {
+			connStatus = "DISCONNECTED"
+		}
+		
+		hours, minutes := tui.GetOnlineTime()
+		onlineTime := fmt.Sprintf("Online: %dh %dm", hours, minutes)
+		
+		var roomInfo string
+		if roomName != "" && roomID != "" && roomName != "Unknown" {
+			roomInfo = fmt.Sprintf("Room: %s (%s)", roomName, roomID)
+		} else {
+			roomInfo = fmt.Sprintf("Room: %s", roomID)
+		}
+		
+		statusText := fmt.Sprintf("[yellow]%s[white] | [green]%s[white] | [cyan]%s[white] | [blue]%s[white]", 
+			currentTime, connStatus, onlineTime, roomInfo)
+		
 		tui.statusBar.Clear()
-		timeStr := time.Now().Format("15:04:05")
-		fmt.Fprintf(tui.statusBar, "[gray]%s[white] %s", timeStr, status)
+		fmt.Fprint(tui.statusBar, statusText)
 	})
 }
 
@@ -310,11 +350,20 @@ func NewChatBot(config *Config, tui *TUI) *ChatBot {
 		httpClient:      &http.Client{Timeout: 30 * time.Second},
 		messageInterval: time.Duration(config.IntervalSeconds) * time.Second,
 		currentRoom:     "1",
+		currentRoomName: "Unknown",
 		messages:        config.Messages,
 		currentMsgIndex: 0,
 		tui:             tui,
 		isConnected:     false,
 		reconnectCount:  0,
+	}
+}
+
+// log is a helper function to log to the TUI instead of stdout
+func (bot *ChatBot) log(format string, args ...interface{}) {
+	message := fmt.Sprintf(format, args...)
+	if bot.tui != nil {
+		bot.tui.AddLogMessage(message)
 	}
 }
 
@@ -328,12 +377,17 @@ func (bot *ChatBot) setConnectionStatus(connected bool) {
 	
 	if connected && !wasConnected {
 		bot.reconnectCount = 0
-		bot.tui.UpdateStatus(fmt.Sprintf("Connected as %s | Room: %s | Type /help for commands", bot.username, bot.currentRoom))
+		bot.updateFullStatus()
 		bot.log("🟢 Connection status: CONNECTED")
 	} else if !connected && wasConnected {
-		bot.tui.UpdateStatus(fmt.Sprintf("DISCONNECTED - Attempting reconnect... | %s", bot.username))
+		bot.updateFullStatus()
 		bot.log("🔴 Connection status: DISCONNECTED")
 	}
+}
+
+// updateFullStatus updates the complete status bar
+func (bot *ChatBot) updateFullStatus() {
+	bot.tui.UpdateStatusBar(bot.username, bot.isConnected, bot.currentRoomName, bot.currentRoom)
 }
 
 // isConnectionHealthy checks if connection is healthy
@@ -370,7 +424,7 @@ func (bot *ChatBot) fullReconnect() error {
 	delay := bot.calculateReconnectDelay()
 	
 	bot.log("🔄 Attempting full reconnection #%d (delay: %v)...", bot.reconnectCount, delay)
-	bot.tui.UpdateStatus(fmt.Sprintf("Reconnecting... (attempt %d, delay %v)", bot.reconnectCount, delay))
+	bot.tui.UpdateStatusBar(bot.username, false, bot.currentRoomName, fmt.Sprintf("Reconnecting... (attempt %d)", bot.reconnectCount))
 	
 	// Wait with exponential backoff
 	time.Sleep(delay)
@@ -407,14 +461,6 @@ func (bot *ChatBot) fullReconnect() error {
 	bot.tui.AddChatMessage("", "", "*** Reconnected to chat server ***")
 	
 	return nil
-}
-
-// log is a helper function to log to the TUI instead of stdout
-func (bot *ChatBot) log(format string, args ...interface{}) {
-	message := fmt.Sprintf(format, args...)
-	if bot.tui != nil {
-		bot.tui.AddLogMessage(message)
-	}
 }
 
 // login handles the authentication process
@@ -763,8 +809,9 @@ func (bot *ChatBot) listenForMessages() {
 						if bot.currentRoom != newRoomID {
 							bot.log("🚪 Room changed by server: %s -> %s (%s)", bot.currentRoom, newRoomID, nameVal)
 							bot.currentRoom = newRoomID
+							bot.currentRoomName = nameVal
 							bot.tui.SetRoom(newRoomID, nameVal)
-							bot.tui.UpdateStatus(fmt.Sprintf("Connected as %s | Room: %s | Type /help for commands", bot.username, newRoomID))
+							bot.updateFullStatus()
 						}
 					}
 				}
@@ -857,6 +904,21 @@ func (bot *ChatBot) listenForMessages() {
 
 			// Handle system events
 			if player, hasPlayer := messageData["player"].(map[string]interface{}); hasPlayer {
+				// Handle onlineTime updates
+				if onlineTime, hasOnlineTime := player["onlineTime"].(map[string]interface{}); hasOnlineTime {
+					if hours, hasHours := onlineTime["hours"]; hasHours {
+						if minutes, hasMinutes := onlineTime["minutes"]; hasMinutes {
+							if h, hOk := hours.(float64); hOk {
+								if m, mOk := minutes.(float64); mOk {
+									bot.tui.UpdateOnlineTime(int(h), int(m))
+									bot.updateFullStatus()
+									bot.log("⏰ Online time updated: %dh %dm", int(h), int(m))
+								}
+							}
+						}
+					}
+				}
+
 				// Handle newHour events
 				if newHour, hasNewHour := player["newHour"].(bool); hasNewHour && newHour {
 					bot.log("🕐 'newHour' event detected from server - sending acknowledgment...")
@@ -1008,9 +1070,11 @@ func (bot *ChatBot) setupInputHandler() {
 						if bot.isConnectionHealthy() {
 							wsStatus = "Connected"
 						}
+						hours, minutes := bot.tui.GetOnlineTime()
 						bot.tui.AddChatMessage("", "", fmt.Sprintf("Username: %s", bot.username))
-						bot.tui.AddChatMessage("", "", fmt.Sprintf("Current Room: %s", bot.currentRoom))
+						bot.tui.AddChatMessage("", "", fmt.Sprintf("Current Room: %s (%s)", bot.currentRoomName, bot.currentRoom))
 						bot.tui.AddChatMessage("", "", fmt.Sprintf("WebSocket: %s", wsStatus))
+						bot.tui.AddChatMessage("", "", fmt.Sprintf("Online Time: %dh %dm", hours, minutes))
 						bot.tui.AddChatMessage("", "", fmt.Sprintf("Message Interval: %v", bot.messageInterval))
 						bot.tui.AddChatMessage("", "", fmt.Sprintf("Reconnect Count: %d", bot.reconnectCount))
 						if !bot.lastReconnect.IsZero() {
@@ -1079,19 +1143,31 @@ func (bot *ChatBot) sendKeepAlive() {
 	}
 }
 
+// startStatusUpdater keeps the status bar current time updated
+func (bot *ChatBot) startStatusUpdater() {
+	bot.log("⏰ Starting status updater (5 second interval)")
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		// Update the status bar with current time (other info stays the same)
+		bot.updateFullStatus()
+	}
+}
+
 // Start initializes and runs the bot
 func (bot *ChatBot) Start() error {
 	bot.log("🚀 Starting Skyskraber chat bot...")
-	bot.tui.UpdateStatus("Starting bot...")
+	bot.tui.UpdateStatusBar(bot.username, false, "", "Starting...")
 
 	bot.log("🔐 Step 1: Authenticating...")
-	bot.tui.UpdateStatus("Authenticating...")
+	bot.tui.UpdateStatusBar(bot.username, false, "", "Authenticating...")
 	if err := bot.login(); err != nil {
 		return fmt.Errorf("login failed: %v", err)
 	}
 
 	bot.log("🔌 Step 2: Establishing WebSocket connection...")
-	bot.tui.UpdateStatus("Connecting to WebSocket...")
+	bot.tui.UpdateStatusBar(bot.username, false, "", "Connecting...")
 	if err := bot.connectWebSocket(); err != nil {
 		return fmt.Errorf("WebSocket connection failed: %v", err)
 	}
@@ -1101,22 +1177,22 @@ func (bot *ChatBot) Start() error {
 	bot.lastReconnect = time.Now()
 
 	bot.log("👂 Step 3: Starting message listener...")
-	bot.tui.UpdateStatus("Starting message listener...")
 	go bot.listenForMessages()
 
 	bot.log("🕐 Step 4: Starting periodic message sender...")
-	bot.tui.UpdateStatus("Starting periodic message sender...")
 	go bot.sendPeriodicMessages()
 
 	bot.log("💓 Step 5: Starting keep-alive routine...")
-	bot.tui.UpdateStatus("Starting keep-alive...")
 	go bot.sendKeepAlive()
 
-	bot.log("⌨️ Step 6: Setting up input handler...")
+	bot.log("⏰ Step 6: Starting status updater...")
+	go bot.startStatusUpdater()
+
+	bot.log("⌨️ Step 7: Setting up input handler...")
 	bot.setupInputHandler()
 
 	bot.log("✅ Bot started successfully! 🎉")
-	bot.tui.UpdateStatus(fmt.Sprintf("Connected as %s | Room: %s | Type /help for commands", bot.username, bot.currentRoom))
+	bot.updateFullStatus()
 	
 	bot.tui.AddChatMessage("", "", "=== Skyskraber Chat Bot Started ===")
 	bot.tui.AddChatMessage("", "", "Type /help for available commands")
