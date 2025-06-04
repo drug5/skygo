@@ -1,4 +1,4 @@
-yaml# GitLab CI Pipeline for Go Bot - Simplified Build Targets
+# GitLab CI Pipeline for skyGO - Automatic Releases
 image: golang:1.21-alpine
 
 # Define stages
@@ -12,6 +12,7 @@ variables:
   GO_VERSION: "1.21"
   CGO_ENABLED: "0"
   GOPROXY: "https://proxy.golang.org,direct"
+  PROJECT_NAME: "skyGO"
 
 # Cache Go modules for faster builds
 cache:
@@ -47,57 +48,136 @@ test:
     - main
     - develop
 
-# Build stage - Windows, AMD64, and ARM64 only
+# Build stage - Automatically triggered on main branch pushes
 build:
   stage: build
   script:
     - mkdir -p dist
     
-    # Linux AMD64 (x86_64) - Most common Linux servers
-    - GOOS=linux GOARCH=amd64 go build -ldflags="-s -w -X main.version=$CI_COMMIT_SHORT_SHA -X main.buildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o dist/skyGO-linux-amd64 main.go
+    # Get version info
+    - VERSION=${CI_COMMIT_SHORT_SHA}
+    - BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    - echo "Building version $VERSION at $BUILD_TIME"
     
-    # Linux ARM64 (ARM 64-bit) - ARM servers, Raspberry Pi 4+, Apple Silicon servers
-    - GOOS=linux GOARCH=arm64 go build -ldflags="-s -w -X main.version=$CI_COMMIT_SHORT_SHA -X main.buildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o dist/skyGO-linux-arm64 main.go
+    # Linux AMD64 (x86_64)
+    - GOOS=linux GOARCH=amd64 go build -ldflags="-s -w -X main.version=$VERSION -X main.buildTime=$BUILD_TIME" -o dist/${PROJECT_NAME}-linux-amd64 main.go
     
-    # Windows AMD64 - For Windows systems
-    - GOOS=windows GOARCH=amd64 go build -ldflags="-s -w -X main.version=$CI_COMMIT_SHORT_SHA -X main.buildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o dist/skyGO-windows-amd64.exe main.go
+    # Linux ARM64 (ARM 64-bit)
+    - GOOS=linux GOARCH=arm64 go build -ldflags="-s -w -X main.version=$VERSION -X main.buildTime=$BUILD_TIME" -o dist/${PROJECT_NAME}-linux-arm64 main.go
+    
+    # Windows AMD64
+    - GOOS=windows GOARCH=amd64 go build -ldflags="-s -w -X main.version=$VERSION -X main.buildTime=$BUILD_TIME" -o dist/${PROJECT_NAME}-windows-amd64.exe main.go
     
     # Make Linux binaries executable
-    - chmod +x dist/skyGO-linux-*
+    - chmod +x dist/${PROJECT_NAME}-linux-*
     
     # Show build info
     - ls -la dist/
-    - file dist/*
+    - file dist/* || true
+    
+    # Create checksums for security
+    - cd dist && sha256sum * > checksums.txt && cd ..
+    - cat dist/checksums.txt
     
   artifacts:
-    name: "skyGO-$CI_COMMIT_SHORT_SHA"
+    name: "${PROJECT_NAME}-build-$CI_COMMIT_SHORT_SHA"
     paths:
       - dist/
     expire_in: 1 month
   only:
     - main
-    - tags
-    - merge_requests
+    - develop
 
-# Release stage - Only for tags
-release:
+# Automatic release job - Creates release for every main branch push
+auto-release:
   stage: release
   image: registry.gitlab.com/gitlab-org/release-cli:latest
   needs:
     - build
   script:
-    - echo "Creating release for tag $CI_COMMIT_TAG"
+    - echo "Creating automatic release for commit $CI_COMMIT_SHORT_SHA"
+    - ls -la dist/
   release:
-    name: 'Release $CI_COMMIT_TAG'
-    description: 'skyGO Release $CI_COMMIT_TAG'
+    name: 'skyGO Build $CI_COMMIT_SHORT_SHA'
+    description: |
+      Automatic build release for skyGO
+      
+      **Commit**: $CI_COMMIT_SHA
+      **Branch**: $CI_COMMIT_REF_NAME
+      **Built**: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+      
+      ## Changes
+      $CI_COMMIT_MESSAGE
+      
+      ## Downloads
+      - Linux AMD64: Download below
+      - Linux ARM64: Download below  
+      - Windows AMD64: Download below
+    tag_name: 'build-$CI_COMMIT_SHORT_SHA'
+    assets:
+      links:
+        - name: 'Linux AMD64 Binary'
+          url: '$CI_PROJECT_URL/-/jobs/artifacts/$CI_COMMIT_SHA/raw/dist/${PROJECT_NAME}-linux-amd64?job=build'
+          link_type: 'package'
+        - name: 'Linux ARM64 Binary'
+          url: '$CI_PROJECT_URL/-/jobs/artifacts/$CI_COMMIT_SHA/raw/dist/${PROJECT_NAME}-linux-arm64?job=build'
+          link_type: 'package'
+        - name: 'Windows AMD64 Binary'
+          url: '$CI_PROJECT_URL/-/jobs/artifacts/$CI_COMMIT_SHA/raw/dist/${PROJECT_NAME}-windows-amd64.exe?job=build'
+          link_type: 'package'
+        - name: 'Checksums'
+          url: '$CI_PROJECT_URL/-/jobs/artifacts/$CI_COMMIT_SHA/raw/dist/checksums.txt?job=build'
+          link_type: 'other'
+  only:
+    - main
+
+# Tagged release job - For official versions (v1.0.0, etc.)
+tagged-release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  needs:
+    - build
+  script:
+    - echo "Creating official release for tag $CI_COMMIT_TAG"
+  release:
+    name: 'skyGO $CI_COMMIT_TAG'
+    description: |
+      Official release of skyGO $CI_COMMIT_TAG
+      
+      ## Downloads
+      Choose the binary for your platform:
+      - **Linux AMD64**: Most Linux servers and desktops
+      - **Linux ARM64**: ARM servers, Raspberry Pi 4+
+      - **Windows AMD64**: Windows desktops and servers
+      
+      ## Installation
+      1. Download the appropriate binary
+      2. Make executable (Linux): `chmod +x skyGO-*`
+      3. Run: `./skyGO-linux-amd64` or `skyGO-windows-amd64.exe`
     tag_name: '$CI_COMMIT_TAG'
     assets:
       links:
         - name: 'Linux AMD64 Binary'
-          url: '$CI_PROJECT_URL/-/jobs/artifacts/$CI_COMMIT_TAG/raw/dist/skyGO-linux-amd64?job=build'
-        - name: 'Linux ARM64 Binary' 
-          url: '$CI_PROJECT_URL/-/jobs/artifacts/$CI_COMMIT_TAG/raw/dist/skyGO-linux-arm64?job=build'
+          url: '$CI_PROJECT_URL/-/jobs/artifacts/$CI_COMMIT_TAG/raw/dist/${PROJECT_NAME}-linux-amd64?job=build'
+          link_type: 'package'
+        - name: 'Linux ARM64 Binary'
+          url: '$CI_PROJECT_URL/-/jobs/artifacts/$CI_COMMIT_TAG/raw/dist/${PROJECT_NAME}-linux-arm64?job=build'
+          link_type: 'package'
         - name: 'Windows AMD64 Binary'
-          url: '$CI_PROJECT_URL/-/jobs/artifacts/$CI_COMMIT_TAG/raw/dist/skyGO-windows-amd64.exe?job=build'
+          url: '$CI_PROJECT_URL/-/jobs/artifacts/$CI_COMMIT_TAG/raw/dist/${PROJECT_NAME}-windows-amd64.exe?job=build'
+          link_type: 'package'
+        - name: 'Checksums'
+          url: '$CI_PROJECT_URL/-/jobs/artifacts/$CI_COMMIT_TAG/raw/dist/checksums.txt?job=build'
+          link_type: 'other'
   only:
     - tags
+
+# Optional: Cleanup old releases (manual job)
+cleanup-releases:
+  stage: release
+  script:
+    - echo "Manual cleanup job - remove old build releases if needed"
+    - echo "This would clean up releases older than 30 days"
+  when: manual
+  only:
+    - main
