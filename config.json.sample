@@ -1,12 +1,27 @@
 {
   "username": "YourUsername",
   "password": "YourPassword",
-  "intervalSeconds": 300,
+  "intervalSeconds": {
+    "from": 60,
+    "to": 120
+  },
+  "loginAction": {
+    "loginActionEnabled": true,
+    "waitSeconds": 30,
+    "timeBetweenCommands": 10,
+    "commands": [
+      "/move",
+      "/autopick",
+      "Hello everyone! I'm back online.",
+      "/move",
+      "How is everyone doing today?"
+    ]
+  },
   "messages": [
-    "...",
-    ".",
-    ",",
-    ".."
+    "Having a great time here!",
+    "Hope everyone is doing well!",
+    "Beautiful day, isn't it?",
+    "Anyone up for some chat?"
   ],
   "baseUrl": "https://www.skyskraber.dk",
   "webSocketUrl": "wss://www.skyskraber.dk/ws"

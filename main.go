@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"os"
 	"os/signal"
@@ -18,6 +19,12 @@ import (
 	"github.com/rivo/tview"
 )
 
+// IntervalConfig holds the random interval configuration
+type IntervalConfig struct {
+	From int `json:"from"`
+	To   int `json:"to"`
+}
+
 // LoginAction holds the login action configuration
 type LoginAction struct {
 	LoginActionEnabled   bool     `json:"loginActionEnabled"`
@@ -28,13 +35,13 @@ type LoginAction struct {
 
 // Config holds the bot's configuration
 type Config struct {
-	Username        string       `json:"username"`
-	Password        string       `json:"password"`
-	IntervalSeconds int          `json:"intervalSeconds"`
-	LoginAction     *LoginAction `json:"loginAction,omitempty"`
-	Messages        []string     `json:"messages"`
-	BaseURL         string       `json:"baseUrl,omitempty"`
-	WebSocketURL    string       `json:"webSocketUrl,omitempty"`
+	Username        string           `json:"username"`
+	Password        string           `json:"password"`
+	IntervalSeconds *IntervalConfig  `json:"intervalSeconds"`
+	LoginAction     *LoginAction     `json:"loginAction,omitempty"`
+	Messages        []string         `json:"messages"`
+	BaseURL         string           `json:"baseUrl,omitempty"`
+	WebSocketURL    string           `json:"webSocketUrl,omitempty"`
 }
 
 // TUI handles the terminal user interface
@@ -75,7 +82,7 @@ type ChatBot struct {
 	httpClient      *http.Client
 	wsConn          *websocket.Conn
 	cookies         []*http.Cookie
-	messageInterval time.Duration
+	intervalConfig  *IntervalConfig
 	messages        []string
 	currentMsgIndex int
 	wsMutex         sync.Mutex
@@ -595,9 +602,12 @@ func (tui *TUI) Stop() {
 // loadConfig loads configuration from a JSON file or creates a template
 func loadConfig(configPath string) (*Config, error) {
 	defaultConfig := &Config{
-		Username:        "CHANGE_THIS_USERNAME",
-		Password:        "CHANGE_THIS_PASSWORD",
-		IntervalSeconds: 300,
+		Username: "CHANGE_THIS_USERNAME",
+		Password: "CHANGE_THIS_PASSWORD",
+		IntervalSeconds: &IntervalConfig{
+			From: 250,
+			To:   350,
+		},
 		LoginAction: &LoginAction{
 			LoginActionEnabled:   false,
 			WaitSeconds:         30,
@@ -633,8 +643,45 @@ func loadConfig(configPath string) (*Config, error) {
 		return nil, fmt.Errorf("failed to read config file: %v", err)
 	}
 
-	var config Config
-	if errJson := json.Unmarshal(configFile, &config); errJson != nil {
+	// First, parse into a generic map to handle intervalSeconds flexibility
+	var rawConfig map[string]interface{}
+	if errJson := json.Unmarshal(configFile, &rawConfig); errJson != nil {
+		return nil, fmt.Errorf("failed to parse config file: %v", errJson)
+	}
+
+	// Create the config struct
+	config := &Config{}
+
+	// Handle intervalSeconds - support both old int format and new object format
+	if intervalData, exists := rawConfig["intervalSeconds"]; exists {
+		switch v := intervalData.(type) {
+		case float64: // JSON numbers are parsed as float64
+			// Old format: single integer
+			seconds := int(v)
+			config.IntervalSeconds = &IntervalConfig{
+				From: seconds,
+				To:   seconds,
+			}
+		case map[string]interface{}: // New format: object with from/to
+			intervalConfig := &IntervalConfig{}
+			if from, ok := v["from"].(float64); ok {
+				intervalConfig.From = int(from)
+			}
+			if to, ok := v["to"].(float64); ok {
+				intervalConfig.To = int(to)
+			}
+			// Validate that from <= to
+			if intervalConfig.From > intervalConfig.To {
+				return nil, fmt.Errorf("intervalSeconds: 'from' (%d) cannot be greater than 'to' (%d)", intervalConfig.From, intervalConfig.To)
+			}
+			config.IntervalSeconds = intervalConfig
+		default:
+			return nil, fmt.Errorf("intervalSeconds must be either a number or an object with 'from' and 'to' fields")
+		}
+	}
+
+	// Parse the rest of the config normally
+	if errJson := json.Unmarshal(configFile, config); errJson != nil {
 		return nil, fmt.Errorf("failed to parse config file: %v", errJson)
 	}
 
@@ -645,6 +692,9 @@ func loadConfig(configPath string) (*Config, error) {
 	if config.WebSocketURL == "" {
 		config.WebSocketURL = "wss://www.skyskraber.dk/ws"
 	}
+	if config.IntervalSeconds == nil {
+		config.IntervalSeconds = &IntervalConfig{From: 300, To: 300}
+	}
 	if config.LoginAction == nil {
 		config.LoginAction = &LoginAction{
 			LoginActionEnabled:   false,
@@ -654,7 +704,15 @@ func loadConfig(configPath string) (*Config, error) {
 		}
 	}
 
-	return &config, nil
+	// Validate interval configuration
+	if config.IntervalSeconds.From <= 0 || config.IntervalSeconds.To <= 0 {
+		return nil, fmt.Errorf("intervalSeconds: both 'from' and 'to' must be positive numbers")
+	}
+	if config.IntervalSeconds.From > config.IntervalSeconds.To {
+		return nil, fmt.Errorf("intervalSeconds: 'from' (%d) cannot be greater than 'to' (%d)", config.IntervalSeconds.From, config.IntervalSeconds.To)
+	}
+
+	return config, nil
 }
 
 // NewChatBot creates a new ChatBot instance
@@ -665,7 +723,7 @@ func NewChatBot(config *Config, tui *TUI) *ChatBot {
 		baseURL:         config.BaseURL,
 		wsURL:           config.WebSocketURL,
 		httpClient:      &http.Client{Timeout: 30 * time.Second},
-		messageInterval: time.Duration(config.IntervalSeconds) * time.Second,
+		intervalConfig:  config.IntervalSeconds,
 		currentRoom:     "1",
 		currentRoomName: "Unknown",
 		messages:        config.Messages,
@@ -694,6 +752,37 @@ func (bot *ChatBot) log(format string, args ...interface{}) {
 	if bot.tui != nil {
 		bot.tui.AddLogMessage(message)
 	}
+}
+
+// getRandomInterval calculates a random interval between configured from/to values
+func (bot *ChatBot) getRandomInterval() time.Duration {
+	if bot.intervalConfig == nil {
+		return 300 * time.Second // Default fallback
+	}
+	
+	from := bot.intervalConfig.From
+	to := bot.intervalConfig.To
+	
+	if from == to {
+		return time.Duration(from) * time.Second
+	}
+	
+	// Generate random number between from and to (inclusive)
+	randomSeconds := from + rand.Intn(to-from+1)
+	return time.Duration(randomSeconds) * time.Second
+}
+
+// getIntervalString returns a human-readable string describing the interval configuration
+func (bot *ChatBot) getIntervalString() string {
+	if bot.intervalConfig == nil {
+		return "300s (default)"
+	}
+	
+	if bot.intervalConfig.From == bot.intervalConfig.To {
+		return fmt.Sprintf("%ds (fixed)", bot.intervalConfig.From)
+	}
+	
+	return fmt.Sprintf("%d-%ds (random)", bot.intervalConfig.From, bot.intervalConfig.To)
 }
 
 // executeLoginActions performs the configured login actions after successful connection
@@ -788,7 +877,7 @@ func (bot *ChatBot) executeCommand(input string) {
 			bot.tui.AddChatMessage("", "", fmt.Sprintf("Current Room: %s (%s)", bot.currentRoomName, bot.currentRoom))
 			bot.tui.AddChatMessage("", "", fmt.Sprintf("WebSocket: %s", wsStatus))
 			bot.tui.AddChatMessage("", "", fmt.Sprintf("Online Time: %dh %dm", hours, minutes))
-			bot.tui.AddChatMessage("", "", fmt.Sprintf("Message Interval: %v", bot.messageInterval))
+			bot.tui.AddChatMessage("", "", fmt.Sprintf("Message Interval: %s", bot.getIntervalString()))
 			bot.tui.AddChatMessage("", "", fmt.Sprintf("Autopick: %s", autopickStatus))
 			bot.tui.AddChatMessage("", "", fmt.Sprintf("Reconnect Count: %d", bot.reconnectCount))
 			if !bot.lastReconnect.IsZero() {
@@ -1594,11 +1683,13 @@ func (bot *ChatBot) sendConsoleMessage(message string) error {
 	return err
 }
 
-// resetMessageTimer stops and resets the periodic message timer
+// resetMessageTimer stops and resets the periodic message timer with a new random interval
 func (bot *ChatBot) resetMessageTimer() {
 	bot.timerMutex.Lock()
 	defer bot.timerMutex.Unlock()
 
+	newInterval := bot.getRandomInterval()
+	
 	if bot.messageTimer != nil {
 		if !bot.messageTimer.Stop() {
 			select {
@@ -1606,8 +1697,8 @@ func (bot *ChatBot) resetMessageTimer() {
 			default:
 			}
 		}
-		bot.messageTimer.Reset(bot.messageInterval)
-		bot.log("⏰ Message timer reset to %v", bot.messageInterval)
+		bot.messageTimer.Reset(newInterval)
+		bot.log("⏰ Message timer reset to %v", newInterval)
 	} else {
 		bot.log("⚠️ Tried to reset a nil message timer.")
 	}
@@ -2000,19 +2091,23 @@ func (bot *ChatBot) listenForMessages() {
 	}
 }
 
-// sendPeriodicMessages sends messages from the configured list at intervals
+// sendPeriodicMessages sends messages from the configured list at random intervals
 func (bot *ChatBot) sendPeriodicMessages() {
 	if len(bot.messages) == 0 || bot.messages[0] == "ADD_YOUR_MESSAGES_HERE" {
 		bot.log("⚠️ No valid periodic messages configured. Periodic sender will not run.")
 		return
 	}
-	bot.log("🕐 Starting periodic message sender (interval: %v)", bot.messageInterval)
+	bot.log("🕐 Starting periodic message sender (interval: %s)", bot.getIntervalString())
+
+	// Initialize with first random interval
+	initialInterval := bot.getRandomInterval()
+	bot.log("🎲 First message will be sent in %v", initialInterval)
 
 	bot.timerMutex.Lock()
 	if bot.messageTimer == nil {
-		bot.messageTimer = time.NewTimer(bot.messageInterval)
+		bot.messageTimer = time.NewTimer(initialInterval)
 	} else {
-		bot.messageTimer.Reset(bot.messageInterval)
+		bot.messageTimer.Reset(initialInterval)
 	}
 	bot.timerMutex.Unlock()
 
@@ -2040,9 +2135,13 @@ func (bot *ChatBot) sendPeriodicMessages() {
 			bot.log("⚠️ Skipping periodic message - connection not healthy")
 		}
 
+		// Reset timer with new random interval
+		newInterval := bot.getRandomInterval()
+		bot.log("🎲 Next message will be sent in %v", newInterval)
+		
 		bot.timerMutex.Lock()
 		if bot.messageTimer != nil {
-			bot.messageTimer.Reset(bot.messageInterval)
+			bot.messageTimer.Reset(newInterval)
 		}
 		bot.timerMutex.Unlock()
 	}
@@ -2191,6 +2290,9 @@ func (bot *ChatBot) Stop() {
 
 // main is the entry point of the application
 func main() {
+	// Initialize random number generator for random intervals
+	rand.Seed(time.Now().UnixNano())
+
 	config, err := loadConfig("config.json")
 	if err != nil {
 		fmt.Printf("❌ CRITICAL: Failed to load config: %v\n", err)
@@ -2219,7 +2321,11 @@ func main() {
 	}
 	if len(os.Args) > 3 {
 		if interval, errAtoi := strconv.Atoi(os.Args[3]); errAtoi == nil && interval > 0 {
-			config.IntervalSeconds = interval
+			// Convert old-style command line argument to new format
+			config.IntervalSeconds = &IntervalConfig{
+				From: interval,
+				To:   interval,
+			}
 		}
 	}
 
