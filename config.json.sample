@@ -1,5 +1,5 @@
 {
-  "username": "YourUsername"
+  "username": "YourUsername",
   "password": "YourPassword",
   "intervalSeconds": 300,
   "messages": [
