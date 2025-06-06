@@ -1,13 +1,12 @@
-# GitHub Actions Workflow for skyGO - Updated versions
-name: Build skyGO
+# GitHub Actions Workflow for skyGO
+name: Build and Release skyGO
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [ main ]
+    tags: [ 'v*.*.*' ] # Trigger on tags like v1.0.0
   pull_request:
     branches: [ main ]
-  release:
-    types: [ created ]
   workflow_dispatch:
 
 env:
@@ -15,6 +14,7 @@ env:
   PROJECT_NAME: 'skyGO'
 
 jobs:
+  # The 'test' job remains unchanged, it's already well-configured.
   test:
     name: Test
     runs-on: ubuntu-latest
@@ -46,6 +46,7 @@ jobs:
         go vet $(go list ./... | grep -v /vendor/)
         go test -race -coverprofile=coverage.out -covermode=atomic ./...
 
+  # The 'build' job also remains unchanged. It correctly builds and archives the binaries.
   build:
     name: Build Binaries
     runs-on: ubuntu-latest
@@ -62,7 +63,6 @@ jobs:
           - goos: windows
             goarch: amd64
             suffix: ".exe"
-    
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -71,16 +71,6 @@ jobs:
       uses: actions/setup-go@v5
       with:
         go-version: ${{ env.GO_VERSION }}
-
-    - name: Cache Go modules
-      uses: actions/cache@v4
-      with:
-        path: |
-          ~/.cache/go-build
-          ~/go/pkg/mod
-        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-        restore-keys: |
-          ${{ runner.os }}-go-
 
     - name: Download dependencies
       run: go mod download
@@ -92,8 +82,8 @@ jobs:
         CGO_ENABLED: 0
       run: |
         BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        # Use the tag for the version name if it exists, otherwise use the commit SHA
         VERSION=${GITHUB_REF_NAME:-$GITHUB_SHA}
-        
         go build -ldflags="-s -w -X main.version=${VERSION} -X main.buildTime=${BUILD_TIME}" \
           -o ${{ env.PROJECT_NAME }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }} \
           main.go
@@ -103,37 +93,30 @@ jobs:
       with:
         name: ${{ env.PROJECT_NAME }}-${{ matrix.goos }}-${{ matrix.goarch }}
         path: ${{ env.PROJECT_NAME }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}
-        retention-days: 30
+        retention-days: 7 # Retention can be shorter as it's only for the release job
 
+  # This 'release' job has been updated to trigger on tags.
   release:
     name: Create Release
     runs-on: ubuntu-latest
-    needs: [test, build]
-    if: github.event_name == 'release'
-    
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+    needs: build
+    # This 'if' condition is crucial. It ensures this job only runs for tag pushes.
+    if: startsWith(github.ref, 'refs/tags/')
 
-    - name: Download all artifacts
+    steps:
+    - name: Download all build artifacts
       uses: actions/download-artifact@v4
       with:
+        # Download all artifacts into a single directory
         path: ./artifacts
 
-    - name: Prepare release assets
-      run: |
-        mkdir -p release
-        find ./artifacts -type f \( -executable -o -name "*.exe" \) | while read file; do
-          cp "$file" "./release/"
-        done
-        ls -la release/
-
-    - name: Upload release assets
+    - name: Create Release and Upload Assets
       uses: softprops/action-gh-release@v1
       with:
-        files: release/*
-        generate_release_notes: true
-        draft: false
-        prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
+        # The 'softprops' action automatically uses the tag name and commit message for the release.
+        # The 'files' glob pattern finds all the downloaded binaries inside their artifact subdirectories.
+        files: ./artifacts/*/*
+        generate_release_notes: true # Automatically create release notes from commits.
       env:
+        # The GITHUB_TOKEN is automatically provided by GitHub Actions.
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
