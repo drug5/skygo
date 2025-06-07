@@ -1,6 +1,5 @@
 # Various
 config.json
-go.sum
 dev/
 logs/
 
@@ -26,6 +25,7 @@ go.work
 # Build artifacts
 dist/
 skyGO-*
+skuGO
 
 # Config files with credentials
 config.json

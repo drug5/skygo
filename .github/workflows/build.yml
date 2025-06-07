@@ -1,6 +1,5 @@
 # GitHub Actions Workflow for skyGO
 name: Build and Release skyGO
-
 on:
   push:
     branches: [ main ]
@@ -8,11 +7,9 @@ on:
   pull_request:
     branches: [ main ]
   workflow_dispatch:
-
 env:
   GO_VERSION: '1.21'
   PROJECT_NAME: 'skyGO'
-
 jobs:
   # The 'test' job remains unchanged, it's already well-configured.
   test:
@@ -21,12 +18,10 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-
     - name: Set up Go
       uses: actions/setup-go@v5
       with:
         go-version: ${{ env.GO_VERSION }}
-
     - name: Cache Go modules
       uses: actions/cache@v4
       with:
@@ -36,17 +31,16 @@ jobs:
         key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
         restore-keys: |
           ${{ runner.os }}-go-
-
     - name: Download dependencies
-      run: go mod download
-
+      run: |
+        go mod tidy
+        go mod download
     - name: Run tests
       run: |
         go fmt $(go list ./... | grep -v /vendor/)
         go vet $(go list ./... | grep -v /vendor/)
         go test -race -coverprofile=coverage.out -covermode=atomic ./...
-
-  # The 'build' job also remains unchanged. It correctly builds and archives the binaries.
+  # Updated build job to handle multiple Go files
   build:
     name: Build Binaries
     runs-on: ubuntu-latest
@@ -66,15 +60,14 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-
     - name: Set up Go
       uses: actions/setup-go@v5
       with:
         go-version: ${{ env.GO_VERSION }}
-
     - name: Download dependencies
-      run: go mod download
-
+      run: |
+        go mod tidy
+        go mod download
     - name: Build binary
       env:
         GOOS: ${{ matrix.goos }}
@@ -84,17 +77,24 @@ jobs:
         BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
         # Use the tag for the version name if it exists, otherwise use the commit SHA
         VERSION=${GITHUB_REF_NAME:-$GITHUB_SHA}
+        # Debug: List Go files
+        echo "Go files in directory:"
+        ls -la *.go
+        # Debug: Check go.mod and dependencies
+        echo "Go version:"
+        go version
+        echo "Go list:"
+        go list .
+        # Build all Go files in the module
         go build -ldflags="-s -w -X main.version=${VERSION} -X main.buildTime=${BUILD_TIME}" \
           -o ${{ env.PROJECT_NAME }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }} \
-          main.go
-
+          .
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
         name: ${{ env.PROJECT_NAME }}-${{ matrix.goos }}-${{ matrix.goarch }}
         path: ${{ env.PROJECT_NAME }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}
         retention-days: 7 # Retention can be shorter as it's only for the release job
-
   # This 'release' job has been updated to trigger on tags.
   release:
     name: Create Release
@@ -102,14 +102,12 @@ jobs:
     needs: build
     # This 'if' condition is crucial. It ensures this job only runs for tag pushes.
     if: startsWith(github.ref, 'refs/tags/')
-
     steps:
     - name: Download all build artifacts
       uses: actions/download-artifact@v4
       with:
         # Download all artifacts into a single directory
         path: ./artifacts
-
     - name: Create Release and Upload Assets
       uses: softprops/action-gh-release@v1
       with:
